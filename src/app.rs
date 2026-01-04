@@ -287,6 +287,9 @@ pub struct Sukusho {
     /// Index statistics
     #[allow(dead_code)]
     index_stats: crate::indexer::IndexStats,
+
+    /// Toast notification manager
+    toast_manager: crate::ui::ToastManager,
 }
 
 impl Sukusho {
@@ -427,6 +430,7 @@ impl Sukusho {
             search_query: String::new(),
             search_results: None,
             index_stats: crate::indexer::IndexStats::default(),
+            toast_manager: crate::ui::ToastManager::new(),
         };
 
         // Prewarm models if indexing is enabled (creates SINGLE shared model instances)
@@ -560,6 +564,9 @@ impl Sukusho {
 
     /// Process incoming messages from background threads
     fn process_messages(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Update toast manager to remove expired toasts
+        self.toast_manager.update();
+
         // Collect messages up to limit to avoid blocking UI
         let messages: Vec<AppMessage> = {
             let app_state = cx.global::<AppState>();
@@ -837,19 +844,14 @@ impl Sukusho {
                     cx.notify();
                 }
                 AppMessage::CopiedToClipboard(count) => {
-                    info!("Showing clipboard notification for {} items", count);
+                    info!("Showing clipboard toast for {} items", count);
                     // Show toast notification
                     let message = if count == 1 {
                         t!("notifications.copied_to_clipboard.one").to_string()
                     } else {
                         t!("notifications.copied_to_clipboard.other", count = count).to_string()
                     };
-                    window.push_notification(
-                        Notification::new()
-                            .message(&message)
-                            .with_type(NotificationType::Success),
-                        cx,
-                    );
+                    self.toast_manager.show(message);
                     cx.notify();
                 }
             }
@@ -1406,6 +1408,8 @@ impl Render for Sukusho {
                         self.render_gallery(has_more, cx).into_any_element()
                     }),
             )
+            // Render toast overlay at bottom center
+            .child(self.toast_manager.render())
     }
 }
 
