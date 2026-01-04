@@ -2,11 +2,11 @@
 
 use gpui::prelude::FluentBuilder;
 use gpui::*;
+use gpui_component::WindowExt;
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::notification::{Notification, NotificationType};
 use gpui_component::switch::Switch;
-use gpui_component::WindowExt;
-use gpui_component::{h_flex, v_flex, ActiveTheme, Disableable, Sizable};
+use gpui_component::{ActiveTheme, Disableable, Sizable, h_flex, v_flex};
 use log::info;
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -29,7 +29,7 @@ use crate::organizer;
 use crate::settings::ConversionFormat;
 use crate::thumbnail::ThumbnailCache;
 use crate::ui::gallery;
-use crate::{set_latest_screenshot, AppMessage, AppState};
+use crate::{AppMessage, AppState, set_latest_screenshot};
 
 /// App version
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -42,7 +42,7 @@ fn start_window_drag(_window: &mut Window) {
     use crate::tray::WINDOW_HWND;
     use windows::Win32::Foundation::HWND;
     use windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture;
-    use windows::Win32::UI::WindowsAndMessaging::{SendMessageW, HTCAPTION, WM_NCLBUTTONDOWN};
+    use windows::Win32::UI::WindowsAndMessaging::{HTCAPTION, SendMessageW, WM_NCLBUTTONDOWN};
 
     if let Some(hwnd) = *WINDOW_HWND.lock() {
         unsafe {
@@ -69,14 +69,14 @@ fn start_window_drag(_window: &mut Window) {
 pub fn pick_folder() -> Option<PathBuf> {
     use std::ffi::OsString;
     use std::os::windows::ffi::OsStringExt;
-    use windows::core::PWSTR;
     use windows::Win32::System::Com::{
-        CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
-        COINIT_APARTMENTTHREADED,
+        CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
+        CoUninitialize,
     };
     use windows::Win32::UI::Shell::{
-        FileOpenDialog, IFileDialog, IShellItem, FOS_PICKFOLDERS, SIGDN_FILESYSPATH,
+        FOS_PICKFOLDERS, FileOpenDialog, IFileDialog, IShellItem, SIGDN_FILESYSPATH,
     };
+    use windows::core::PWSTR;
 
     unsafe {
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
@@ -1602,7 +1602,7 @@ impl TrayBin {
                             .small()
                             .label("GitHub")
                             .on_click(|_, _, cx| {
-                                cx.open_url("https://github.com/user/traybin");
+                                cx.open_url("https://github.com/ssut/traybin");
                             }),
                     ),
             )
