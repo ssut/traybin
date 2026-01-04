@@ -64,8 +64,8 @@ impl ScreenshotWatcher {
             },
         )?;
 
-        // Watch the directory (non-recursive - we organize files into subdirs)
-        debouncer.watch(&self.directory, RecursiveMode::NonRecursive)?;
+        // Watch the directory recursively to detect deletions in subdirectories
+        debouncer.watch(&self.directory, RecursiveMode::Recursive)?;
 
         info!("File watcher started successfully");
 
@@ -146,7 +146,14 @@ impl ScreenshotWatcher {
         use notify::EventKind;
 
         for path in &event.paths {
-            if !Self::is_image_file(path) {
+            // For Remove events, file no longer exists so we only check extension
+            // For other events, we check if it's actually a file
+            let dominated_event = match &event.kind {
+                EventKind::Remove(_) => Self::has_image_extension(path),
+                _ => Self::is_image_file(path),
+            };
+
+            if !dominated_event {
                 continue;
             }
 
@@ -211,12 +218,17 @@ impl ScreenshotWatcher {
         }
     }
 
-    /// Check if a path is an image file we care about
+    /// Check if a path is an image file we care about (file must exist)
     fn is_image_file(path: &Path) -> bool {
         if !path.is_file() {
             return false;
         }
+        Self::has_image_extension(path)
+    }
 
+    /// Check if a path has an image extension (doesn't check if file exists)
+    /// Used for Remove events where the file no longer exists
+    fn has_image_extension(path: &Path) -> bool {
         path.extension()
             .and_then(|ext| ext.to_str())
             .is_some_and(|ext| {
