@@ -4,10 +4,12 @@ use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_component::WindowExt;
 use gpui_component::button::{Button, ButtonVariants};
+use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::notification::{Notification, NotificationType};
 use gpui_component::switch::Switch;
 use gpui_component::{ActiveTheme, Disableable, Sizable, h_flex, v_flex};
-use log::info;
+use log::{error, info};
+use parking_lot::Mutex;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -19,6 +21,7 @@ pub enum SettingsPage {
     #[default]
     General,
     Conversion,
+    Indexing,
     Hotkey,
     About,
 }
@@ -30,11 +33,20 @@ use crate::settings::ConversionFormat;
 use crate::thumbnail::ThumbnailCache;
 use crate::ui::gallery;
 use crate::{AppMessage, AppState, set_latest_screenshot};
+use fastembed;
 
 /// App version
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// App name
-const APP_NAME: &str = "TrayBin";
+const APP_NAME: &str = "Sukusho";
+
+/// Global prewarmed text embedding model (single shared instance for all searches)
+static PREWARMED_TEXT_MODEL: parking_lot::Mutex<Option<Arc<Mutex<fastembed::TextEmbedding>>>> =
+    parking_lot::Mutex::new(None);
+
+/// Global prewarmed vision embedding model (single shared instance for all indexing)
+static PREWARMED_VISION_MODEL: parking_lot::Mutex<Option<Arc<Mutex<fastembed::ImageEmbedding>>>> =
+    parking_lot::Mutex::new(None);
 
 /// Start native window drag using Windows API
 #[cfg(windows)]
@@ -42,14 +54,14 @@ fn start_window_drag(_window: &mut Window) {
     use crate::tray::WINDOW_HWND;
     use windows::Win32::Foundation::HWND;
     use windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture;
-    use windows::Win32::UI::WindowsAndMessaging::{HTCAPTION, SendMessageW, WM_NCLBUTTONDOWN};
+    use windows::Win32::UI::WindowsAndMessaging::{HTCAPTION, PostMessageW, WM_NCLBUTTONDOWN};
 
     if let Some(hwnd) = *WINDOW_HWND.lock() {
         unsafe {
             // Release mouse capture first
             let _ = ReleaseCapture();
-            // Send message to start window drag (simulate title bar click)
-            SendMessageW(
+            // Post message to start window drag (asynchronous to avoid RefCell conflicts)
+            let _ = PostMessageW(
                 HWND(hwnd as *mut std::ffi::c_void),
                 WM_NCLBUTTONDOWN,
                 windows::Win32::Foundation::WPARAM(HTCAPTION as usize),
@@ -189,7 +201,7 @@ pub enum GalleryAction {
 }
 
 /// Main application view
-pub struct TrayBin {
+pub struct Sukusho {
     /// All screenshot paths (sorted by modification time, newest first)
     all_screenshots: Vec<ScreenshotInfo>,
 
@@ -220,6 +232,12 @@ pub struct TrayBin {
     /// Focus handle for keyboard events
     focus_handle: FocusHandle,
 
+    /// Search input state
+    search_input: Entity<InputState>,
+
+    /// Whether search input has focus
+    search_input_focused: bool,
+
     /// Whether we're recording a new hotkey
     recording_hotkey: bool,
 
@@ -240,14 +258,146 @@ pub struct TrayBin {
 
     /// Current file being converted
     convert_current_file: String,
+
+    /// Whether we're currently downloading models
+    downloading_models: bool,
+
+    /// Model download progress (current, total)
+    model_download_progress: (usize, usize),
+
+    /// Whether models have been downloaded
+    models_downloaded: bool,
+
+    /// Whether we're currently indexing files
+    indexing: bool,
+
+    /// Indexing progress (current, total)
+    index_progress: (usize, usize),
+
+    /// Current file being indexed
+    index_current_file: String,
+
+    /// Search query
+    search_query: String,
+
+    /// Search results (None = show all, Some = filtered)
+    search_results: Option<Vec<PathBuf>>,
+
+    /// Index statistics
+    #[allow(dead_code)]
+    index_stats: crate::indexer::IndexStats,
 }
 
-impl TrayBin {
-    pub fn new(_window: &mut Window, cx: &mut Context<Self>) -> Self {
+impl Sukusho {
+    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let app_state = cx.global::<AppState>();
         let settings = app_state.settings.lock().clone();
 
-        Self {
+        // Create search input state
+        let search_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Search images... (e.g., \"cat\", \"sunset\", \"code\")")
+        });
+
+        // Subscribe to search input events
+        cx.subscribe_in(&search_input, window, |this, state, event, _window, cx| {
+            match event {
+                InputEvent::Focus => {
+                    this.search_input_focused = true;
+                }
+                InputEvent::Blur => {
+                    this.search_input_focused = false;
+                }
+                InputEvent::Change => {
+                    // Use the state parameter directly (no RefCell borrow of this.search_input)
+                    let text = state.read(cx).value().to_string();
+                    this.search_query = text.clone();
+
+                    // Clear search results if query is empty
+                    if text.is_empty() {
+                        this.search_results = None;
+                    }
+                    cx.notify();
+                }
+                InputEvent::PressEnter { .. } => {
+                    // Use the state parameter directly (no RefCell borrow of this.search_input)
+                    let query = state.read(cx).value().to_string();
+                    if !query.is_empty() {
+                        info!("Starting search for: {}", query);
+
+                        // Get message channel and config
+                        let tx = {
+                            let app_state = cx.global::<AppState>();
+                            app_state.message_tx.clone()
+                        };
+                        let config = {
+                            let app_state = cx.global::<AppState>();
+                            let settings = app_state.settings.lock();
+                            let db_path = crate::settings::Settings::config_path()
+                                .unwrap()
+                                .parent()
+                                .unwrap()
+                                .join("vector_index.db");
+                            crate::indexer::IndexConfig {
+                                db_path,
+                                cpu_mode: if settings.indexing_cpu_mode == "fast" {
+                                    crate::indexer::CpuMode::Fast
+                                } else {
+                                    crate::indexer::CpuMode::Normal
+                                },
+                                screenshot_dir: settings.screenshot_directory.clone(),
+                            }
+                        };
+
+                        // Use prewarmed model if available, otherwise load fresh
+                        if let Some(text_model) = PREWARMED_TEXT_MODEL.lock().clone() {
+                            info!("Using prewarmed model for search");
+                            crate::indexer::search_images(
+                                query.to_string(),
+                                config,
+                                text_model,
+                                tx,
+                                100,
+                            );
+                        } else {
+                            info!("Loading model for search (not prewarmed)");
+                            // Load text model and perform search in background
+                            std::thread::spawn(move || {
+                                let cache_dir = crate::settings::Settings::config_path()
+                                    .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+                                    .unwrap_or_else(|| PathBuf::from("."));
+                                let cache_dir = cache_dir.join(".fastembed_cache");
+
+                                match fastembed::TextEmbedding::try_new(
+                                    fastembed::InitOptions::new(
+                                        fastembed::EmbeddingModel::NomicEmbedTextV15,
+                                    )
+                                    .with_cache_dir(cache_dir)
+                                    .with_show_download_progress(false),
+                                ) {
+                                    Ok(model) => {
+                                        let text_model = Arc::new(Mutex::new(model));
+                                        crate::indexer::search_images(
+                                            query.to_string(),
+                                            config,
+                                            text_model,
+                                            tx,
+                                            100,
+                                        );
+                                    }
+                                    Err(e) => {
+                                        error!("Failed to load text model for search: {}", e);
+                                    }
+                                }
+                            });
+                        }
+                    }
+                }
+            }
+        })
+        .detach();
+
+        let app = Self {
             all_screenshots: Vec::new(),
             visible_count: PAGE_SIZE,
             selected: HashSet::new(),
@@ -258,6 +408,8 @@ impl TrayBin {
             grid_columns: settings.grid_columns,
             thumbnail_size: settings.thumbnail_size,
             focus_handle: cx.focus_handle(),
+            search_input,
+            search_input_focused: false,
             recording_hotkey: false,
             organizing: false,
             organize_progress: (0, 0),
@@ -265,7 +417,71 @@ impl TrayBin {
             converting: false,
             convert_progress: (0, 0),
             convert_current_file: String::new(),
+            downloading_models: false,
+            model_download_progress: (0, 0),
+            models_downloaded: settings.models_downloaded,
+            indexing: false,
+            index_progress: (0, 0),
+            index_current_file: String::new(),
+            search_query: String::new(),
+            search_results: None,
+            index_stats: crate::indexer::IndexStats::default(),
+        };
+
+        // Prewarm models if indexing is enabled (creates SINGLE shared model instances)
+        if settings.indexing_enabled && settings.models_downloaded {
+            info!("Prewarming embedding models (single shared instances)...");
+            let cache_dir = crate::settings::Settings::config_path()
+                .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+                .unwrap_or_else(|| PathBuf::from("."));
+            let cache_dir = cache_dir.join(".fastembed_cache");
+
+            // Load models in background thread (blocking operation)
+            // The models are wrapped in Arc<Mutex<>> so they can be shared across threads
+            std::thread::spawn(move || {
+                info!("Loading vision embedding model in background...");
+                match fastembed::ImageEmbedding::try_new(
+                    fastembed::ImageInitOptions::new(
+                        fastembed::ImageEmbeddingModel::NomicEmbedVisionV15,
+                    )
+                    .with_cache_dir(cache_dir.clone())
+                    .with_show_download_progress(false),
+                ) {
+                    Ok(model) => {
+                        info!("Vision embedding model loaded successfully - setting global state");
+                        // Create a SINGLE Arc<Mutex<>> wrapped model that will be shared
+                        let vision_model = Arc::new(Mutex::new(model));
+                        // Store in global static for access from indexing function
+                        *PREWARMED_VISION_MODEL.lock() = Some(vision_model);
+                        info!("Vision model prewarmed and ready for indexing");
+                    }
+                    Err(e) => {
+                        error!("Failed to prewarm vision embedding model: {}", e);
+                    }
+                }
+
+                info!("Loading text embedding model in background...");
+                match fastembed::TextEmbedding::try_new(
+                    fastembed::InitOptions::new(fastembed::EmbeddingModel::NomicEmbedTextV15)
+                        .with_cache_dir(cache_dir)
+                        .with_show_download_progress(false),
+                ) {
+                    Ok(model) => {
+                        info!("Text embedding model loaded successfully - setting global state");
+                        // Create a SINGLE Arc<Mutex<>> wrapped model that will be shared
+                        let text_model = Arc::new(Mutex::new(model));
+                        // Store in global static for access from search function
+                        *PREWARMED_TEXT_MODEL.lock() = Some(text_model);
+                        info!("Text model prewarmed and ready for search");
+                    }
+                    Err(e) => {
+                        error!("Failed to prewarm text embedding model: {}", e);
+                    }
+                }
+            });
         }
+
+        app
     }
 
     /// Convert a keystroke to a hotkey string
@@ -365,8 +581,8 @@ impl TrayBin {
         // Now process collected messages
         for msg in messages {
             match msg {
-                AppMessage::NewScreenshot(path) => {
-                    self.add_screenshot(path, cx);
+                AppMessage::NewScreenshot(path, should_auto_index) => {
+                    self.add_screenshot(path, should_auto_index, cx);
                 }
                 AppMessage::ScreenshotRemoved(path) => {
                     self.remove_screenshot(&path, cx);
@@ -450,6 +666,175 @@ impl TrayBin {
                     self.convert_current_file = String::new();
                     cx.notify();
                 }
+                AppMessage::ModelDownloadProgress(current, total, model) => {
+                    info!("Model download progress: {}/{} ({})", current, total, model);
+                    self.downloading_models = true;
+                    self.model_download_progress = (current, total);
+                    cx.notify();
+                }
+                AppMessage::ModelDownloadCompleted => {
+                    info!("Model download completed");
+                    self.downloading_models = false;
+                    self.models_downloaded = true;
+
+                    // Text model will be loaded on-demand when search is triggered
+
+                    // Save to settings
+                    {
+                        let app_state = cx.global::<AppState>();
+                        let mut settings = app_state.settings.lock();
+                        settings.models_downloaded = true;
+                        let _ = settings.save();
+                    }
+
+                    // Show notification
+                    window.push_notification(
+                        Notification::new()
+                            .message("Search models downloaded successfully")
+                            .with_type(NotificationType::Success),
+                        cx,
+                    );
+
+                    cx.notify();
+                }
+                AppMessage::ModelDownloadFailed(error) => {
+                    error!("Model download failed: {}", error);
+                    self.downloading_models = false;
+
+                    // Auto-disable indexing
+                    {
+                        let app_state = cx.global::<AppState>();
+                        let mut settings = app_state.settings.lock();
+                        settings.indexing_enabled = false;
+                        let _ = settings.save();
+                    }
+
+                    // Show error notification
+                    window.push_notification(
+                        Notification::new()
+                            .message(format!("Model download failed: {}", error))
+                            .with_type(NotificationType::Error),
+                        cx,
+                    );
+
+                    cx.notify();
+                }
+                AppMessage::IndexStarted(total) => {
+                    info!("Indexing started: {} files", total);
+                    self.indexing = true;
+                    self.index_progress = (0, total);
+                    self.index_current_file = String::new();
+                    cx.notify();
+                }
+                AppMessage::IndexProgress(current, total, file) => {
+                    self.index_progress = (current, total);
+                    self.index_current_file = file;
+                    cx.notify();
+                }
+                AppMessage::IndexCompleted(newly_indexed_count) => {
+                    info!(
+                        "Indexing completed: {} new images indexed",
+                        newly_indexed_count
+                    );
+                    self.indexing = false;
+                    self.index_progress = (0, 0);
+                    self.index_current_file = String::new();
+
+                    // Query database for actual total indexed count
+                    let (screenshot_dir, cpu_mode) = {
+                        let app_state = cx.global::<AppState>();
+                        let settings = app_state.settings.lock();
+                        (
+                            settings.screenshot_directory.clone(),
+                            settings.indexing_cpu_mode.clone(),
+                        )
+                    };
+
+                    let db_path = crate::settings::Settings::config_path()
+                        .unwrap()
+                        .parent()
+                        .unwrap()
+                        .join("vector_index.db");
+
+                    // Get total count from database in background
+                    let settings_arc = {
+                        let app_state = cx.global::<AppState>();
+                        Arc::clone(&app_state.settings)
+                    };
+
+                    std::thread::spawn(move || {
+                        let config = crate::indexer::IndexConfig {
+                            db_path,
+                            cpu_mode: if cpu_mode == "fast" {
+                                crate::indexer::CpuMode::Fast
+                            } else {
+                                crate::indexer::CpuMode::Normal
+                            },
+                            screenshot_dir,
+                        };
+
+                        if let Ok(total_count) = crate::indexer::get_indexed_count(&config) {
+                            let mut settings = settings_arc.lock();
+                            settings.last_indexed_count = total_count;
+                            let _ = settings.save();
+                            info!("Total indexed count updated: {}", total_count);
+                        }
+                    });
+
+                    cx.notify();
+                }
+                AppMessage::IndexFailed(error) => {
+                    error!("Indexing failed: {}", error);
+                    self.indexing = false;
+
+                    // Show error notification
+                    window.push_notification(
+                        Notification::new()
+                            .message(format!("Indexing failed: {}", error))
+                            .with_type(NotificationType::Error),
+                        cx,
+                    );
+
+                    cx.notify();
+                }
+                AppMessage::SearchQuery(query) => {
+                    info!("Search query: {}", query);
+                    self.search_query = query.clone();
+
+                    if query.is_empty() {
+                        // Clear search
+                        self.search_results = None;
+                        cx.notify();
+                    } else if let Some(text_model) = PREWARMED_TEXT_MODEL.lock().clone() {
+                        // Spawn search in background
+                        let app_state = cx.global::<AppState>();
+                        let message_tx = app_state.message_tx.clone();
+                        let settings = app_state.settings.lock();
+                        let screenshot_dir = settings.screenshot_directory.clone();
+                        let config_path = crate::settings::Settings::config_path()
+                            .unwrap()
+                            .parent()
+                            .unwrap()
+                            .join("vector_index.db");
+
+                        let config = crate::indexer::IndexConfig {
+                            db_path: config_path,
+                            cpu_mode: if settings.indexing_cpu_mode == "fast" {
+                                crate::indexer::CpuMode::Fast
+                            } else {
+                                crate::indexer::CpuMode::Normal
+                            },
+                            screenshot_dir,
+                        };
+
+                        crate::indexer::search_images(query, config, text_model, message_tx, 100);
+                    }
+                }
+                AppMessage::SearchResults(paths) => {
+                    info!("Search results: {} images", paths.len());
+                    self.search_results = if paths.is_empty() { None } else { Some(paths) };
+                    cx.notify();
+                }
             }
         }
 
@@ -460,7 +845,7 @@ impl TrayBin {
     }
 
     /// Add a new screenshot
-    fn add_screenshot(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+    fn add_screenshot(&mut self, path: PathBuf, should_auto_index: bool, cx: &mut Context<Self>) {
         if self.all_screenshots.iter().any(|s| s.path == path) {
             return;
         }
@@ -492,12 +877,14 @@ impl TrayBin {
                         // The watcher will pick up the new file automatically
                         // We send a remove for the old path since convert deleted it
                         let _ = message_tx.send(AppMessage::ScreenshotRemoved(path_clone));
-                        let _ = message_tx.send(AppMessage::NewScreenshot(output_path));
+                        let _ = message_tx
+                            .send(AppMessage::NewScreenshot(output_path, should_auto_index));
                     }
                     Err(e) => {
                         log::error!("Failed to convert to {:?}: {}", format, e);
                         // Still add the original PNG if conversion failed
-                        let _ = message_tx.send(AppMessage::NewScreenshot(path_clone));
+                        let _ = message_tx
+                            .send(AppMessage::NewScreenshot(path_clone, should_auto_index));
                     }
                 }
             });
@@ -505,7 +892,7 @@ impl TrayBin {
             return;
         }
 
-        if let Some(info) = ScreenshotInfo::from_path(path) {
+        if let Some(info) = ScreenshotInfo::from_path(path.clone()) {
             let insert_pos = self
                 .all_screenshots
                 .iter()
@@ -519,6 +906,54 @@ impl TrayBin {
 
             self.all_screenshots.insert(insert_pos, info);
             cx.notify();
+
+            // Auto-index the new screenshot if indexing is enabled and this is a truly new screenshot
+            if should_auto_index {
+                let (
+                    indexing_enabled,
+                    models_downloaded,
+                    screenshot_dir,
+                    indexing_cpu_mode,
+                    indexing,
+                ) = {
+                    let app_state = cx.global::<AppState>();
+                    let settings = app_state.settings.lock();
+                    (
+                        settings.indexing_enabled,
+                        settings.models_downloaded,
+                        settings.screenshot_directory.clone(),
+                        settings.indexing_cpu_mode.clone(),
+                        self.indexing,
+                    )
+                };
+
+                if indexing_enabled && models_downloaded && !indexing {
+                    info!("Auto-indexing new screenshot: {:?}", path);
+                    let tx = {
+                        let app_state = cx.global::<AppState>();
+                        app_state.message_tx.clone()
+                    };
+                    let db_path = crate::settings::Settings::config_path()
+                        .unwrap()
+                        .parent()
+                        .unwrap()
+                        .join("vector_index.db");
+                    let config = crate::indexer::IndexConfig {
+                        db_path,
+                        cpu_mode: if indexing_cpu_mode == "fast" {
+                            crate::indexer::CpuMode::Fast
+                        } else {
+                            crate::indexer::CpuMode::Normal
+                        },
+                        screenshot_dir,
+                    };
+                    // Get prewarmed models for instant indexing (no loading needed)
+                    let vision_model = PREWARMED_VISION_MODEL.lock().clone();
+                    let text_model = PREWARMED_TEXT_MODEL.lock().clone();
+                    // Index only new files (force_all = false) with prewarmed models
+                    crate::indexer::start_indexing(config, tx, false, vision_model, text_model);
+                }
+            }
         }
     }
 
@@ -527,6 +962,37 @@ impl TrayBin {
         self.all_screenshots.retain(|s| s.path != *path);
         self.selected.remove(path);
         self.thumbnail_cache.invalidate(path);
+
+        // Cleanup vector DB if indexing is enabled
+        let (indexing_enabled, screenshot_dir, indexing_cpu_mode) = {
+            let app_state = cx.global::<AppState>();
+            let settings = app_state.settings.lock();
+            (
+                settings.indexing_enabled,
+                settings.screenshot_directory.clone(),
+                settings.indexing_cpu_mode.clone(),
+            )
+        };
+
+        if indexing_enabled {
+            let db_path = crate::settings::Settings::config_path()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .join("vector_index.db");
+            let config = crate::indexer::IndexConfig {
+                db_path,
+                cpu_mode: if indexing_cpu_mode == "fast" {
+                    crate::indexer::CpuMode::Fast
+                } else {
+                    crate::indexer::CpuMode::Normal
+                },
+                screenshot_dir,
+            };
+            // Remove from vector DB in background
+            crate::indexer::remove_from_index(path.clone(), config);
+        }
+
         cx.notify();
     }
 
@@ -680,7 +1146,7 @@ impl TrayBin {
     }
 }
 
-impl Render for TrayBin {
+impl Render for Sukusho {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Process any pending messages
         self.process_messages(window, cx);
@@ -699,6 +1165,11 @@ impl Render for TrayBin {
             .track_focus(&self.focus_handle)
             // Keyboard shortcuts
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                // Skip handling if search input has focus
+                if this.search_input_focused {
+                    return;
+                }
+
                 // Handle hotkey recording
                 if this.recording_hotkey {
                     // ESC cancels recording
@@ -925,17 +1396,60 @@ impl Render for TrayBin {
     }
 }
 
-impl TrayBin {
+impl Sukusho {
     fn render_gallery(&self, has_more: bool, cx: &mut Context<Self>) -> impl IntoElement {
-        gallery(
-            self.visible_screenshots().to_vec(),
-            self.selected.clone(),
-            Arc::clone(&self.thumbnail_cache),
-            self.grid_columns,
-            self.thumbnail_size,
-            has_more,
-            cx,
-        )
+        let search_enabled = self.models_downloaded;
+        let has_search_results = self.search_results.is_some();
+
+        v_flex()
+            .size_full()
+            // Search bar (only show if models are downloaded)
+            .when(search_enabled, |el| {
+                el.child(
+                    h_flex()
+                        .w_full()
+                        .px_4()
+                        .py_3()
+                        .bg(cx.theme().background)
+                        .border_b_1()
+                        .border_color(cx.theme().border)
+                        .child(
+                            h_flex()
+                                .w_full()
+                                .px_4()
+                                .gap_2()
+                                .items_center()
+                                .child(Input::new(&self.search_input).flex_1())
+                                .when(has_search_results, |el| {
+                                    el.child(
+                                        Button::new("clear-search")
+                                            .small()
+                                            .ghost()
+                                            .label("Clear")
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                this.search_input.update(cx, |input, cx| {
+                                                    input.set_value("", window, cx);
+                                                });
+                                                this.search_query.clear();
+                                                this.search_results = None;
+                                                cx.notify();
+                                            })),
+                                    )
+                                }),
+                        ),
+                )
+            })
+            // Gallery
+            .child(gallery(
+                self.visible_screenshots().to_vec(),
+                self.search_results.clone(),
+                self.selected.clone(),
+                Arc::clone(&self.thumbnail_cache),
+                self.grid_columns,
+                self.thumbnail_size,
+                has_more,
+                cx,
+            ))
     }
 
     fn render_settings(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -971,6 +1485,12 @@ impl TrayBin {
                         cx,
                     ))
                     .child(self.render_settings_tab(
+                        "Indexing",
+                        SettingsPage::Indexing,
+                        current_page,
+                        cx,
+                    ))
+                    .child(self.render_settings_tab(
                         "Hotkey",
                         SettingsPage::Hotkey,
                         current_page,
@@ -997,6 +1517,9 @@ impl TrayBin {
                             .into_any_element(),
                         SettingsPage::Conversion => self
                             .render_conversion_settings(&settings, cx)
+                            .into_any_element(),
+                        SettingsPage::Indexing => self
+                            .render_indexing_settings(&settings, cx)
                             .into_any_element(),
                         SettingsPage::Hotkey => self
                             .render_hotkey_settings(&settings, cx)
@@ -1560,6 +2083,302 @@ impl TrayBin {
             })
     }
 
+    fn render_indexing_settings(
+        &self,
+        settings: &crate::settings::Settings,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let indexing_enabled = settings.indexing_enabled;
+        let cpu_mode = settings.indexing_cpu_mode.clone();
+        let indexed_count = settings.last_indexed_count;
+
+        v_flex()
+            .w_full()
+            .gap_2()
+            // Enable Image Indexing toggle
+            .child(self.render_section_header("Image Indexing & Search (Experimental)", cx))
+            .child(
+                self.render_setting_row(
+                    "Enable Image Indexing",
+                    if self.downloading_models || self.indexing {
+                        None
+                    } else {
+                        Some("AI-powered semantic search (e.g., \"cat\", \"sunset\", \"code\"). Runs locally on your machine - no internet connection needed after model download.")
+                    },
+                    Switch::new("indexing-enable")
+                        .checked(indexing_enabled)
+                        .disabled(self.downloading_models || self.indexing)
+                        .on_click(cx.listener(|this, checked: &bool, _, cx| {
+                            {
+                                let app_state = cx.global::<AppState>();
+                                let mut settings = app_state.settings.lock();
+                                settings.indexing_enabled = *checked;
+                                let _ = settings.save();
+                            }
+                            // If enabling and models not downloaded, trigger download
+                            if *checked && !this.models_downloaded {
+                                let tx = {
+                                    let app_state = cx.global::<AppState>();
+                                    app_state.message_tx.clone()
+                                };
+                                let config = {
+                                    let app_state = cx.global::<AppState>();
+                                    let settings = app_state.settings.lock();
+                                    let db_path = crate::settings::Settings::config_path()
+                                        .unwrap()
+                                        .parent()
+                                        .unwrap()
+                                        .join("vector_index.db");
+                                    crate::indexer::IndexConfig {
+                                        db_path,
+                                        cpu_mode: if settings.indexing_cpu_mode == "fast" {
+                                            crate::indexer::CpuMode::Fast
+                                        } else {
+                                            crate::indexer::CpuMode::Normal
+                                        },
+                                        screenshot_dir: settings.screenshot_directory.clone(),
+                                    }
+                                };
+                                // Get prewarmed models if available
+                                let vision_model = PREWARMED_VISION_MODEL.lock().clone();
+                                let text_model = PREWARMED_TEXT_MODEL.lock().clone();
+                                crate::indexer::start_indexing(config, tx, false, vision_model, text_model);
+                            }
+                            cx.notify();
+                        })),
+                    cx,
+                ),
+            )
+            // Model download status (always show if downloading or downloaded)
+            .when(self.downloading_models || self.models_downloaded, |el| {
+                if self.downloading_models {
+                    let (current, total) = self.model_download_progress;
+                    // Extract model info from the third parameter which now contains detailed description
+                    let progress_pct = if total > 0 {
+                        (current as f32 / total as f32) * 100.0
+                    } else {
+                        0.0
+                    };
+                    el.child(
+                        v_flex()
+                            .w_full()
+                            .gap_2()
+                            .mb_4()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(cx.theme().foreground)
+                                    .child("Model Status"),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(format!("Loading models... ({}/{})", current, total)),
+                            )
+                            .child(
+                                div()
+                                    .w_full()
+                                    .h(px(6.0))
+                                    .rounded(px(3.0))
+                                    .bg(cx.theme().muted)
+                                    .overflow_hidden()
+                                    .child(
+                                        div()
+                                            .h_full()
+                                            .w(relative(progress_pct / 100.0))
+                                            .bg(cx.theme().primary)
+                                            .rounded(px(3.0)),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(format!("{}%", progress_pct as u32)),
+                            )
+                    )
+                } else {
+                    el.child(
+                        v_flex()
+                            .w_full()
+                            .gap_1()
+                            .mb_4()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(cx.theme().foreground)
+                                    .child("Model Status"),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(if PREWARMED_TEXT_MODEL.lock().is_some() && PREWARMED_VISION_MODEL.lock().is_some() {
+                                        "✓ Models Online"
+                                    } else {
+                                        "✓ Models Ready"
+                                    }),
+                            )
+                    )
+                }
+            })
+            // CPU Mode selection (always show, but disable when off or busy)
+            .child(self.render_section_header("Settings", cx))
+            .child(
+                self.render_setting_row(
+                    "CPU Mode",
+                    Some("Normal: balanced, Fast: max performance"),
+                    h_flex()
+                        .gap_2()
+                        .child(
+                            Button::new("cpu-normal")
+                                .small()
+                                .when(cpu_mode == "normal", |s| s.primary())
+                                .when(cpu_mode != "normal", |s| s.outline())
+                                .label("Normal")
+                                .disabled(!indexing_enabled || self.downloading_models || self.indexing)
+                                .on_click(cx.listener(|_this, _, _, cx| {
+                                    {
+                                        let app_state = cx.global::<AppState>();
+                                        let mut settings = app_state.settings.lock();
+                                        settings.indexing_cpu_mode = "normal".to_string();
+                                        let _ = settings.save();
+                                    }
+                                    cx.notify();
+                                })),
+                        )
+                        .child(
+                            Button::new("cpu-fast")
+                                .small()
+                                .when(cpu_mode == "fast", |s| s.primary())
+                                .when(cpu_mode != "fast", |s| s.outline())
+                                .label("Fast")
+                                .disabled(!indexing_enabled || self.downloading_models || self.indexing)
+                                .on_click(cx.listener(|_this, _, _, cx| {
+                                    {
+                                        let app_state = cx.global::<AppState>();
+                                        let mut settings = app_state.settings.lock();
+                                        settings.indexing_cpu_mode = "fast".to_string();
+                                        let _ = settings.save();
+                                    }
+                                    cx.notify();
+                                })),
+                        ),
+                    cx,
+                )
+            )
+            // Indexing progress
+            .when(self.indexing, |el| {
+                let (current, total) = self.index_progress;
+                let progress_pct = if total > 0 {
+                    (current as f32 / total as f32) * 100.0
+                } else {
+                    0.0
+                };
+                el.child(self.render_section_header("Indexing Progress", cx))
+                    .child(
+                        v_flex()
+                            .w_full()
+                            .gap_2()
+                            .mb_4()
+                            .child(
+                                div()
+                                    .w_full()
+                                    .h(px(8.0))
+                                    .rounded(px(4.0))
+                                    .bg(cx.theme().muted)
+                                    .overflow_hidden()
+                                    .child(
+                                        div()
+                                            .h_full()
+                                            .w(relative(progress_pct / 100.0))
+                                            .bg(cx.theme().primary)
+                                            .rounded(px(4.0)),
+                                    ),
+                            )
+                            .child(
+                                h_flex()
+                                    .w_full()
+                                    .justify_between()
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .max_w(px(200.0))
+                                            .overflow_x_hidden()
+                                            .child(if self.index_current_file.is_empty() {
+                                                "Indexing images...".to_string()
+                                            } else {
+                                                self.index_current_file.clone()
+                                            }),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(format!("{}/{} images", current, total)),
+                                    ),
+                            ),
+                    )
+            })
+            // Index stats and manual re-index button (always show if models downloaded, regardless of toggle)
+            .when(self.models_downloaded, |el| {
+                el.child(self.render_section_header("Index Status", cx))
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .gap_2()
+                            .items_center()
+                            .mb_4()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(format!("{} images indexed", indexed_count)),
+                            )
+                            .child(
+                                Button::new("index-new-button")
+                                    .small()
+                                    .outline()
+                                    .label("Index New Files")
+                                    .disabled(!indexing_enabled || self.indexing || self.downloading_models)
+                                    .on_click(cx.listener(|_this, _, _, cx| {
+                                        let tx = {
+                                            let app_state = cx.global::<AppState>();
+                                            app_state.message_tx.clone()
+                                        };
+                                        let config = {
+                                            let app_state = cx.global::<AppState>();
+                                            let settings = app_state.settings.lock();
+                                            let db_path = crate::settings::Settings::config_path()
+                                                .unwrap()
+                                                .parent()
+                                                .unwrap()
+                                                .join("vector_index.db");
+                                            crate::indexer::IndexConfig {
+                                                db_path,
+                                                cpu_mode: if settings.indexing_cpu_mode == "fast" {
+                                                    crate::indexer::CpuMode::Fast
+                                                } else {
+                                                    crate::indexer::CpuMode::Normal
+                                                },
+                                                screenshot_dir: settings.screenshot_directory.clone(),
+                                            }
+                                        };
+                                        // Get prewarmed models if available
+                                        let vision_model = PREWARMED_VISION_MODEL.lock().clone();
+                                        let text_model = PREWARMED_TEXT_MODEL.lock().clone();
+                                        crate::indexer::start_indexing(config, tx, false, vision_model, text_model);  // false = only new files
+                                        cx.notify();
+                                    })),
+                            )
+                    )
+            })
+    }
+
     fn render_hotkey_settings(
         &self,
         settings: &crate::settings::Settings,
@@ -1714,7 +2533,7 @@ impl TrayBin {
                             .small()
                             .label("GitHub")
                             .on_click(|_, _, cx| {
-                                cx.open_url("https://github.com/ssut/traybin");
+                                cx.open_url("https://github.com/ssut/sukusho");
                             }),
                     ),
             )

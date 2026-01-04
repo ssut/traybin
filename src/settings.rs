@@ -79,6 +79,22 @@ pub struct Settings {
     /// Screenshot organizer date format (e.g., "YYYY-MM-DD", "YYYY/MM/DD", "YYYY-MM")
     #[serde(default = "default_organizer_format")]
     pub organizer_format: String,
+
+    /// Vector search indexing enabled
+    #[serde(default)]
+    pub indexing_enabled: bool,
+
+    /// Indexing CPU mode ("normal" or "fast")
+    #[serde(default = "default_cpu_mode")]
+    pub indexing_cpu_mode: String,
+
+    /// Whether embedding models have been downloaded
+    #[serde(default)]
+    pub models_downloaded: bool,
+
+    /// Last indexed image count (for stats display)
+    #[serde(default)]
+    pub last_indexed_count: usize,
 }
 
 fn default_hotkey_enabled() -> bool {
@@ -91,6 +107,10 @@ fn default_hotkey() -> String {
 
 fn default_organizer_format() -> String {
     "YYYY-MM-DD".to_string()
+}
+
+fn default_cpu_mode() -> String {
+    "normal".to_string()
 }
 
 impl Default for Settings {
@@ -108,6 +128,10 @@ impl Default for Settings {
             hotkey: "Ctrl+Shift+S".to_string(),
             organizer_enabled: false,
             organizer_format: "YYYY-MM-DD".to_string(),
+            indexing_enabled: false,
+            indexing_cpu_mode: "normal".to_string(),
+            models_downloaded: false,
+            last_indexed_count: 0,
         }
     }
 }
@@ -130,8 +154,8 @@ impl Settings {
     }
 
     /// Get the config file path
-    fn config_path() -> Option<PathBuf> {
-        ProjectDirs::from("com", "traybin", "Traybin")
+    pub fn config_path() -> Option<PathBuf> {
+        ProjectDirs::from("com", "sukusho", "Sukusho")
             .map(|dirs| dirs.config_dir().join("settings.json"))
     }
 

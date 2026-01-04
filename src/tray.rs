@@ -213,7 +213,7 @@ impl TrayManager {
 
         let tray_icon = TrayIconBuilder::new()
             .with_menu(Box::new(menu))
-            .with_tooltip("Traybin - Screenshot Manager")
+            .with_tooltip("Sukusho - Screenshot Manager")
             .with_icon(icon)
             .with_menu_on_left_click(false)
             .build()?;
@@ -365,5 +365,12 @@ impl TrayManager {
 
         Icon::from_rgba(rgba, size, size)
             .map_err(|e| anyhow::anyhow!("Failed to create generated icon: {}", e))
+    }
+
+    /// Update tray icon tooltip
+    pub fn update_tooltip(&mut self, text: &str) {
+        if let Err(e) = self._tray_icon.set_tooltip(Some(text)) {
+            log::warn!("Failed to update tray tooltip: {}", e);
+        }
     }
 }

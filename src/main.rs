@@ -7,6 +7,7 @@ mod clipboard;
 mod convert;
 mod drag_drop;
 mod hotkey;
+mod indexer;
 mod organizer;
 mod settings;
 mod thumbnail;
@@ -23,7 +24,7 @@ use single_instance::SingleInstance;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::app::TrayBin;
+use crate::app::Sukusho;
 use crate::hotkey::init_global_hotkey;
 use crate::settings::Settings;
 use crate::tray::TrayManager;
@@ -51,8 +52,8 @@ fn attach_console() {
 /// Messages sent from background threads to the UI
 #[derive(Debug, Clone)]
 pub enum AppMessage {
-    /// New screenshot detected
-    NewScreenshot(PathBuf),
+    /// New screenshot detected (with auto_index flag)
+    NewScreenshot(PathBuf, bool),
     /// Screenshot removed
     ScreenshotRemoved(PathBuf),
     /// Toggle window visibility (from tray click)
@@ -77,6 +78,24 @@ pub enum AppMessage {
     ConvertProgress(usize, usize, String),
     /// Conversion completed
     ConvertCompleted,
+    /// Model download progress (current, total, model_name)
+    ModelDownloadProgress(usize, usize, String),
+    /// Model download completed
+    ModelDownloadCompleted,
+    /// Model download failed
+    ModelDownloadFailed(String),
+    /// Indexing started with total file count
+    IndexStarted(usize),
+    /// Indexing progress update (current, total, current_file)
+    IndexProgress(usize, usize, String),
+    /// Indexing completed (total_indexed_count)
+    IndexCompleted(usize),
+    /// Indexing failed
+    IndexFailed(String),
+    /// Search query submitted
+    SearchQuery(String),
+    /// Search results returned
+    SearchResults(Vec<PathBuf>),
     /// Quit application
     Quit,
 }
@@ -108,33 +127,37 @@ fn main() -> Result<()> {
     // Check for --console flag to enable debug console
     let args: Vec<String> = std::env::args().collect();
     let console_mode = args.iter().any(|arg| arg == "--console" || arg == "-c");
-    
+
     if console_mode {
         attach_console();
+        // Enable backtraces for RefCell errors in console mode
+        unsafe {
+            std::env::set_var("RUST_BACKTRACE", "1");
+        }
     }
-    
+
     // Initialize logging - write to file in console mode for easier debugging
     let log_level = if console_mode { "debug" } else { "info" };
     
     if console_mode {
         // Log to file for easier reading
-        let log_file = std::fs::File::create("traybin_debug.log").expect("Failed to create log file");
+        let log_file = std::fs::File::create("sukusho_debug.log").expect("Failed to create log file");
         env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(log_level))
             .target(env_logger::Target::Pipe(Box::new(log_file)))
             .init();
-        println!("=== TrayBin Debug Console ===");
-        println!("Logging to: traybin_debug.log");
+        println!("=== Sukusho Debug Console ===");
+        println!("Logging to: sukusho_debug.log");
         println!("Logging level: {}", log_level);
     } else {
         env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(log_level)).init();
     }
-    
-    info!("Starting Traybin...");
+
+    info!("Starting Sukusho...");
 
     // Single instance check - prevent multiple copies from running
-    let instance = SingleInstance::new("traybin-screenshot-manager").unwrap();
+    let instance = SingleInstance::new("sukusho-screenshot-manager").unwrap();
     if !instance.is_single() {
-        warn!("Another instance of Traybin is already running");
+        warn!("Another instance of Sukusho is already running");
         return Ok(());
     }
     info!("Single instance check passed");
@@ -247,7 +270,7 @@ fn main() -> Result<()> {
                     }
                 }
 
-                let view = cx.new(|cx| TrayBin::new(window, cx));
+                let view = cx.new(|cx| Sukusho::new(window, cx));
                 cx.new(|cx| gpui_component::Root::new(view, window, cx))
             })
             .expect("Failed to open window");
@@ -257,9 +280,9 @@ fn main() -> Result<()> {
             info!("App quit requested");
         });
 
-        info!("Traybin started successfully");
+        info!("Sukusho started successfully");
     });
 
-    info!("Traybin shutting down...");
+    info!("Sukusho shutting down...");
     Ok(())
 }

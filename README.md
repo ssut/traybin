@@ -1,21 +1,41 @@
-# TrayBin
+# Sukusho (スクショ)
 
-A lightweight screenshot manager for Windows that lives in your system tray. Inspired by [Screenie](https://www.screenie.io/) for macOS.
+A powerful screenshot manager for Windows with AI-powered semantic search. Lives in your system tray, inspired by [Screenie](https://www.screenie.io/) for macOS.
 
-![TrayBin Screenshot](docs/screenshot.png)
+![Sukusho Screenshot](docs/screenshot.webp)
 
 ## Features
+
+### Core Features
 
 - **System Tray Integration** - Runs quietly in your system tray, always ready when you need it
 - **Global Hotkey** - Toggle the window with a customizable keyboard shortcut (default: `Ctrl+Shift+S`)
 - **GPU-Accelerated UI** - Built with [GPUI](https://gpui.rs/) (Zed's UI framework) for smooth, responsive performance
-- **Smart Organization** - Screenshots automatically grouped by date (Today, Yesterday, This Week, etc.)
-- **Thumbnail Gallery** - Beautiful grid view with adjustable thumbnail sizes
+- **Thumbnail Gallery** - Beautiful grid view with adjustable thumbnail sizes and infinite scroll
 - **Drag & Drop** - Drag screenshots directly into other applications
-- **Multi-Select** - Select multiple items with checkboxes or Ctrl+Click/Shift+Click
-- **Auto-Convert** - Automatically convert PNG screenshots to WebP or JPEG to save space
+- **Multi-Select** - Select multiple items with checkboxes, Ctrl+Click, or Shift+Click
 - **Native Context Menu** - Right-click for Windows shell context menu (Open, Copy, Delete, etc.)
 - **Clipboard Support** - Copy selected files with `Ctrl+C`
+
+### Smart Organization
+
+- **Auto-Organizer** - Automatically organize screenshots into date-based folders
+- **Customizable Format** - Choose your own date format (YYYY-MM-DD, YYYY/MM/DD, etc.)
+- **Manual Organization** - Organize existing screenshots with progress tracking
+
+### Image Processing
+
+- **Auto-Convert** - Automatically convert PNG screenshots to WebP or JPEG to save space
+- **Quality Control** - Adjustable compression quality (1-100)
+- **Batch Convert** - Convert multiple existing files at once
+
+### AI-Powered Search (Experimental)
+
+- **Semantic Search** - Find screenshots by describing what's in them (e.g., "cat", "sunset", "code")
+- **100% Local Processing** - All AI runs on your machine, no internet connection needed after model download
+- **Fast & Private** - Uses prewarmed models for instant results, your screenshots never leave your PC
+- **Vector Database** - Powered by LanceDB for efficient similarity search
+- **Auto-Indexing** - New screenshots are automatically indexed for search
 
 ## Installation
 
@@ -23,14 +43,14 @@ A lightweight screenshot manager for Windows that lives in your system tray. Ins
 
 ```bash
 # Clone the repository
-git clone https://github.com/ssut/traybin.git
-cd traybin
+git clone https://github.com/ssut/sukusho.git
+cd sukusho
 
 # Build release version
 cargo build --release
 
 # Run
-./target/release/traybin.exe
+./target/release/sukusho.exe
 ```
 
 ### Requirements
@@ -78,12 +98,30 @@ Access settings by clicking the gear icon (⚙) in the header.
 
 - **Screenshot Directory** - Folder to watch for new screenshots
 - **Thumbnail Size** - Adjust grid thumbnail size (80-300px)
+- **Grid Columns** - Adjust number of columns in gallery view
+
+### Organizer
+
+- **Enable Auto-Organize** - Automatically organize new screenshots into date-based folders
+- **Date Format** - Choose your preferred folder naming format (YYYY-MM-DD, YYYY/MM/DD, etc.)
+- **Organize Existing** - Manually organize all existing screenshots with progress tracking
 
 ### Conversion
 
 - **Auto-convert Screenshots** - Automatically convert new PNG files
 - **Conversion Format** - Choose WebP or JPEG
 - **Quality** - Image quality (1-100)
+- **Batch Convert** - Convert all existing PNG files at once
+
+### Image Indexing & Search (Experimental)
+
+- **Enable Image Indexing** - Turn on AI-powered semantic search
+- **Download Models** - First-time setup downloads ~150MB of AI models (one-time)
+- **CPU Mode** - Choose between Normal (balanced) or Fast (max performance)
+- **Manual Indexing** - Index all existing screenshots or just new ones
+- **Search** - Use the search bar at the top to find screenshots by describing their content
+
+> **Privacy Note**: All AI processing happens locally on your machine. No screenshots or data are sent to external servers. After initial model download, no internet connection is required.
 
 ### Hotkey
 
@@ -95,7 +133,7 @@ Access settings by clicking the gear icon (⚙) in the header.
 Settings are stored in:
 
 ```
-%APPDATA%\traybin\settings.json
+%APPDATA%\sukusho\settings.json
 ```
 
 Default screenshot directory:
@@ -109,10 +147,10 @@ Default screenshot directory:
 Run with console output for debugging:
 
 ```bash
-traybin.exe --console
+sukusho.exe --console
 ```
 
-Logs are written to `traybin_debug.log` in the current directory.
+Logs are written to `sukusho_debug.log` in the current directory.
 
 ## Tech Stack
 

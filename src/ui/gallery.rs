@@ -4,19 +4,25 @@ use chrono::{DateTime, Datelike, Local, NaiveDate};
 use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_component::scroll::ScrollableElement;
-use gpui_component::{ActiveTheme, InteractiveElementExt};
+use gpui_component::ActiveTheme;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::time::SystemTime;
+use std::sync::{Arc, Mutex as StdMutex};
+use std::time::{Instant, SystemTime};
 
-use crate::app::{format_file_size, GalleryAction, ScreenshotInfo, TrayBin};
+use crate::app::{format_file_size, GalleryAction, ScreenshotInfo, Sukusho};
 use crate::drag_drop;
 use crate::thumbnail::ThumbnailCache;
 
 /// Flag to track if a gallery item was clicked (to prevent background deselection)
 static ITEM_CLICKED: AtomicBool = AtomicBool::new(false);
+
+/// Track last click for double-click detection (time, path)
+static LAST_CLICK: StdMutex<Option<(Instant, PathBuf)>> = StdMutex::new(None);
+
+/// Double-click time threshold in milliseconds
+const DOUBLE_CLICK_TIME_MS: u128 = 500;
 
 /// Date group category
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -106,16 +112,28 @@ struct GalleryItemData {
 /// Build a gallery grid component with date grouping
 pub fn gallery(
     screenshots: Vec<ScreenshotInfo>,
+    filtered_paths: Option<Vec<PathBuf>>,
     selected: HashSet<PathBuf>,
     _thumbnail_cache: Arc<ThumbnailCache>,
     _columns: u32,
     thumbnail_size: u32,
     has_more: bool,
-    cx: &mut Context<TrayBin>,
+    cx: &mut Context<Sukusho>,
 ) -> impl IntoElement {
     let spacing = 8.0;
 
-    if screenshots.is_empty() {
+    // Filter screenshots if search is active
+    let visible_screenshots = if let Some(filter) = filtered_paths {
+        let filter_set: HashSet<_> = filter.into_iter().collect();
+        screenshots
+            .into_iter()
+            .filter(|s| filter_set.contains(&s.path))
+            .collect()
+    } else {
+        screenshots
+    };
+
+    if visible_screenshots.is_empty() {
         return div()
             .size_full()
             .flex()
@@ -130,7 +148,7 @@ pub fn gallery(
     }
 
     // Group screenshots by date
-    let groups = group_by_date(&screenshots);
+    let groups = group_by_date(&visible_screenshots);
 
     // Build grouped content
     let mut content_children: Vec<AnyElement> = Vec::new();
@@ -258,7 +276,7 @@ pub fn gallery(
 }
 
 /// Build a single gallery item with enhanced styling
-fn gallery_item(data: GalleryItemData, cx: &mut Context<TrayBin>) -> impl IntoElement + use<> {
+fn gallery_item(data: GalleryItemData, cx: &mut Context<Sukusho>) -> impl IntoElement + use<> {
     let size_px = px(data.size as f32);
     let path = data.path;
     let path_for_dbl = path.clone();
@@ -402,10 +420,6 @@ fn gallery_item(data: GalleryItemData, cx: &mut Context<TrayBin>) -> impl IntoEl
                         .child(file_badge),
                 ),
         )
-        // Double click - open file
-        .on_double_click(cx.listener(move |this, _event: &ClickEvent, _, cx| {
-            this.handle_action(GalleryAction::Open(path_for_dbl.clone()), cx);
-        }))
         // Right click - context menu (for selected items or just clicked item)
         .on_mouse_down(
             MouseButton::Right,
@@ -428,13 +442,13 @@ fn gallery_item(data: GalleryItemData, cx: &mut Context<TrayBin>) -> impl IntoEl
                 );
             }),
         )
-        // Drag operation - use on_mouse_down with Windows DragDetect for threshold
-        // This avoids GPUI's on_drag which causes RefCell conflicts with DoDragDrop
+        // Drag operation - use Windows DragDetect for threshold detection
         .on_mouse_down(
             MouseButton::Left,
             cx.listener({
                 let drag_paths = drag_paths.clone();
                 let path_for_select = path.clone();
+                let path_for_dblclick = path_for_dbl.clone();
                 move |this, event: &MouseDownEvent, _, cx| {
                     // Mark that an item was clicked (prevent background deselection)
                     ITEM_CLICKED.store(true, Ordering::SeqCst);
@@ -443,6 +457,35 @@ fn gallery_item(data: GalleryItemData, cx: &mut Context<TrayBin>) -> impl IntoEl
                         return;
                     }
 
+                    // Check for double-click BEFORE drag detection
+                    let now = Instant::now();
+                    let is_double_click = {
+                        let mut last_click = LAST_CLICK.lock().unwrap();
+                        let is_dbl = if let Some((last_time, last_path)) = last_click.as_ref() {
+                            let elapsed = now.duration_since(*last_time).as_millis();
+                            elapsed < DOUBLE_CLICK_TIME_MS && last_path == &path_for_dblclick
+                        } else {
+                            false
+                        };
+
+                        if is_dbl {
+                            // Clear last click on double-click
+                            *last_click = None;
+                        } else {
+                            // Record this click
+                            *last_click = Some((now, path_for_dblclick.clone()));
+                        }
+                        is_dbl
+                    };
+
+                    // If double-click detected, open file immediately and skip drag detection
+                    if is_double_click {
+                        log::info!("Double-click detected via timer, opening file: {:?}", path_for_dblclick);
+                        this.handle_action(GalleryAction::Open(path_for_dblclick.clone()), cx);
+                        return;
+                    }
+
+                    // NOT a double-click - proceed with normal drag detection (UNCHANGED)
                     // Use Windows DragDetect for threshold detection
                     // This is a modal function that returns true if user dragged past threshold
                     let should_drag = drag_drop::check_drag_threshold();

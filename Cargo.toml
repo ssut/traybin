@@ -1,5 +1,5 @@
 [package]
-name = "traybin"
+name = "sukusho"
 version = "0.1.0"
 edition = "2024"
 description = "Windows screenshot manager - like Screenie for macOS"
@@ -52,6 +52,14 @@ fast_image_resize = "4"
 rayon = "1.10"
 crossbeam-channel = "0.5"
 parking_lot = "0.12"
+tokio = { version = "1", features = ["rt", "sync", "macros"] }
+futures = "0.3"
+
+# Vector Search & Embeddings
+lancedb = "0.23.1"
+arrow-schema = "56"
+arrow-array = "56"
+fastembed = "5.6"
 
 # Serialization & Config
 serde = { version = "1", features = ["derive"] }

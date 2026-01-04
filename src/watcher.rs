@@ -108,7 +108,8 @@ impl ScreenshotWatcher {
 
         for path in files {
             debug!("Found existing screenshot: {:?}", path);
-            let _ = self.message_tx.send(AppMessage::NewScreenshot(path));
+            // Don't auto-index during initial scan (false)
+            let _ = self.message_tx.send(AppMessage::NewScreenshot(path, false));
             count += 1;
         }
 
@@ -219,8 +220,8 @@ impl ScreenshotWatcher {
                             }
                         }
 
-                        // Send final path to UI
-                        let _ = tx.send(AppMessage::NewScreenshot(current_path));
+                        // Send final path to UI with auto-index flag (true for new screenshots)
+                        let _ = tx.send(AppMessage::NewScreenshot(current_path, true));
                     });
                 }
                 EventKind::Remove(_) => {

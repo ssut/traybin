@@ -185,9 +185,9 @@ pub fn organize_existing_files(base_dir: PathBuf, format: String, message_tx: Se
             match organize_file(file_path, &base_dir, &format) {
                 Ok(Some(new_path)) => {
                     info!("Organized: {:?} -> {:?}", file_path, new_path);
-                    // Notify about the file move
+                    // Notify about the file move (don't auto-index, just organizing existing files)
                     let _ = message_tx.send(AppMessage::ScreenshotRemoved(file_path.clone()));
-                    let _ = message_tx.send(AppMessage::NewScreenshot(new_path));
+                    let _ = message_tx.send(AppMessage::NewScreenshot(new_path, false));
                 }
                 Ok(None) => {
                     // File was already organized, skip
