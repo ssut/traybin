@@ -140,4 +140,41 @@ mod tests {
         assert!(!is_convertible(Path::new("test.jpg")));
         assert!(!is_convertible(Path::new("test.webp")));
     }
+
+    #[test]
+    fn test_is_convertible_edge_cases() {
+        // Test mixed case
+        assert!(is_convertible(Path::new("test.PnG")));
+        assert!(is_convertible(Path::new("test.pNg")));
+
+        // Test files with multiple dots
+        assert!(is_convertible(Path::new("test.backup.png")));
+        assert!(!is_convertible(Path::new("test.backup.jpg")));
+
+        // Test files without extensions
+        assert!(!is_convertible(Path::new("test")));
+
+        // Test other image formats (should not be convertible)
+        assert!(!is_convertible(Path::new("test.gif")));
+        assert!(!is_convertible(Path::new("test.bmp")));
+        assert!(!is_convertible(Path::new("test.avif")));
+    }
+
+    #[test]
+    fn test_conversion_format_extension() {
+        assert_eq!(ConversionFormat::WebP.extension(), "webp");
+        assert_eq!(ConversionFormat::Jpeg.extension(), "jpg");
+    }
+
+    #[test]
+    fn test_conversion_format_display_name() {
+        assert_eq!(ConversionFormat::WebP.display_name(), "WebP");
+        assert_eq!(ConversionFormat::Jpeg.display_name(), "JPEG");
+    }
+
+    #[test]
+    fn test_conversion_format_default() {
+        let default = ConversionFormat::default();
+        assert_eq!(default, ConversionFormat::WebP);
+    }
 }

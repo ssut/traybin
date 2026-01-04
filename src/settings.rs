@@ -176,3 +176,114 @@ mod dirs {
         directories::UserDirs::new().map(|d| d.home_dir().to_path_buf())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_conversion_format_default() {
+        let format = ConversionFormat::default();
+        assert_eq!(format, ConversionFormat::WebP);
+    }
+
+    #[test]
+    fn test_conversion_format_extension() {
+        assert_eq!(ConversionFormat::WebP.extension(), "webp");
+        assert_eq!(ConversionFormat::Jpeg.extension(), "jpg");
+    }
+
+    #[test]
+    fn test_conversion_format_display_name() {
+        assert_eq!(ConversionFormat::WebP.display_name(), "WebP");
+        assert_eq!(ConversionFormat::Jpeg.display_name(), "JPEG");
+    }
+
+    #[test]
+    fn test_settings_default() {
+        let settings = Settings::default();
+
+        // Check default values
+        assert_eq!(settings.grid_columns, 4);
+        assert_eq!(settings.thumbnail_size, 150);
+        assert_eq!(settings.auto_convert_webp, false);
+        assert_eq!(settings.conversion_format, ConversionFormat::WebP);
+        assert_eq!(settings.webp_quality, 85);
+        assert_eq!(settings.window_width, 850.0);
+        assert_eq!(settings.window_height, 650.0);
+        assert_eq!(settings.hotkey_enabled, true);
+        assert_eq!(settings.hotkey, "Ctrl+Shift+S");
+        assert_eq!(settings.organizer_enabled, false);
+        assert_eq!(settings.organizer_format, "YYYY-MM-DD");
+    }
+
+    #[test]
+    fn test_settings_serialization() {
+        let settings = Settings::default();
+
+        // Serialize to JSON
+        let json = serde_json::to_string(&settings).unwrap();
+        assert!(json.contains("grid_columns"));
+        assert!(json.contains("auto_convert_webp"));
+        assert!(json.contains("organizer_enabled"));
+
+        // Deserialize back
+        let deserialized: Settings = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.grid_columns, settings.grid_columns);
+        assert_eq!(deserialized.auto_convert_webp, settings.auto_convert_webp);
+        assert_eq!(deserialized.organizer_enabled, settings.organizer_enabled);
+    }
+
+    #[test]
+    fn test_settings_with_custom_values() {
+        let json = r#"{
+            "screenshot_directory": "/custom/path",
+            "grid_columns": 6,
+            "thumbnail_size": 200,
+            "auto_convert_webp": true,
+            "conversion_format": "Jpeg",
+            "webp_quality": 90,
+            "window_width": 1024.0,
+            "window_height": 768.0,
+            "hotkey_enabled": false,
+            "hotkey": "Ctrl+Alt+S",
+            "organizer_enabled": true,
+            "organizer_format": "YYYY/MM/DD"
+        }"#;
+
+        let settings: Settings = serde_json::from_str(json).unwrap();
+        assert_eq!(settings.grid_columns, 6);
+        assert_eq!(settings.thumbnail_size, 200);
+        assert_eq!(settings.auto_convert_webp, true);
+        assert_eq!(settings.conversion_format, ConversionFormat::Jpeg);
+        assert_eq!(settings.webp_quality, 90);
+        assert_eq!(settings.hotkey_enabled, false);
+        assert_eq!(settings.hotkey, "Ctrl+Alt+S");
+        assert_eq!(settings.organizer_enabled, true);
+        assert_eq!(settings.organizer_format, "YYYY/MM/DD");
+    }
+
+    #[test]
+    fn test_conversion_format_roundtrip() {
+        // Test WebP
+        let format = ConversionFormat::WebP;
+        let json = serde_json::to_string(&format).unwrap();
+        let deserialized: ConversionFormat = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized, ConversionFormat::WebP);
+
+        // Test Jpeg
+        let format = ConversionFormat::Jpeg;
+        let json = serde_json::to_string(&format).unwrap();
+        let deserialized: ConversionFormat = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized, ConversionFormat::Jpeg);
+    }
+
+    #[test]
+    fn test_quality_bounds() {
+        let settings = Settings::default();
+
+        // Default quality should be in valid range
+        assert!(settings.webp_quality >= 1);
+        assert!(settings.webp_quality <= 100);
+    }
+}

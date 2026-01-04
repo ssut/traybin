@@ -107,29 +107,6 @@ pub fn organize_file(file_path: &Path, base_dir: &Path, format: &str) -> Result<
     Ok(Some(target_path))
 }
 
-/// Organize a file in background thread.
-/// Returns immediately, organization happens asynchronously.
-pub fn organize_file_async(
-    file_path: PathBuf,
-    base_dir: PathBuf,
-    format: String,
-    callback: impl FnOnce(Result<Option<PathBuf>>) + Send + 'static,
-) {
-    std::thread::spawn(move || {
-        // Small delay to ensure file is fully written
-        std::thread::sleep(std::time::Duration::from_millis(300));
-
-        let result = organize_file(&file_path, &base_dir, &format);
-        callback(result);
-    });
-}
-
-/// Validate a format string.
-/// Returns true if the format contains at least YYYY or YY.
-pub fn is_valid_format(format: &str) -> bool {
-    format.contains("YYYY") || format.contains("YY")
-}
-
 /// Get example output for a format string using current date.
 pub fn format_preview(format: &str) -> String {
     format_date(Local::now(), format)
@@ -247,11 +224,38 @@ mod tests {
     }
 
     #[test]
-    fn test_is_valid_format() {
-        assert!(is_valid_format("YYYY-MM-DD"));
-        assert!(is_valid_format("YY-MM-DD"));
-        assert!(is_valid_format("YYYY/MM"));
-        assert!(!is_valid_format("MM-DD"));
-        assert!(!is_valid_format(""));
+    fn test_format_date_edge_cases() {
+        // Test single digit month and day
+        let date = Local.with_ymd_and_hms(2024, 2, 5, 10, 30, 0).unwrap();
+        assert_eq!(format_date(date, "YYYY-MM-DD"), "2024-02-05");
+
+        // Test December 31st
+        let date = Local.with_ymd_and_hms(2023, 12, 31, 23, 59, 59).unwrap();
+        assert_eq!(format_date(date, "YYYY-MM-DD"), "2023-12-31");
     }
+
+    #[test]
+    fn test_format_preview() {
+        // Test that format_preview returns a valid date string
+        let preview = format_preview("YYYY-MM-DD");
+        assert!(preview.len() == 10); // Format: "2024-01-15"
+        assert!(preview.contains('-'));
+
+        let preview = format_preview("YYYY/MM/DD");
+        assert!(preview.contains('/'));
+    }
+
+    #[test]
+    fn test_is_image_file() {
+        use std::path::Path;
+
+        // Note: is_image_file requires actual files to exist
+        // We test the extension checking logic via format_date and format_preview tests
+        // For real file testing, we'd need integration tests with temp files
+
+        // Test that non-existent files return false (as expected)
+        assert!(!is_image_file(Path::new("nonexistent.png")));
+        assert!(!is_image_file(Path::new("nonexistent.txt")));
+    }
+
 }

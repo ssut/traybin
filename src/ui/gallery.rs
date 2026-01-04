@@ -7,12 +7,16 @@ use gpui_component::scroll::ScrollableElement;
 use gpui_component::{ActiveTheme, InteractiveElementExt};
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::SystemTime;
 
 use crate::app::{format_file_size, GalleryAction, ScreenshotInfo, TrayBin};
 use crate::drag_drop;
 use crate::thumbnail::ThumbnailCache;
+
+/// Flag to track if a gallery item was clicked (to prevent background deselection)
+static ITEM_CLICKED: AtomicBool = AtomicBool::new(false);
 
 /// Date group category
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -139,6 +143,13 @@ pub fn gallery(
                 .w_full()
                 .pt_4()
                 .pb_2()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|_, _, _, _| {
+                        // Mark that a header was clicked (prevent background deselection)
+                        ITEM_CLICKED.store(true, Ordering::SeqCst);
+                    }),
+                )
                 .child(
                     div()
                         .text_sm()
@@ -197,9 +208,14 @@ pub fn gallery(
                 .text_sm()
                 .text_color(cx.theme().muted_foreground)
                 .child("Loading more...")
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.handle_action(GalleryAction::LoadMore, cx);
-                }))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        // Mark that an item was clicked (prevent background deselection)
+                        ITEM_CLICKED.store(true, Ordering::SeqCst);
+                        this.handle_action(GalleryAction::LoadMore, cx);
+                    }),
+                )
                 .into_any_element(),
         );
     }
@@ -219,7 +235,25 @@ pub fn gallery(
                 this.handle_action(GalleryAction::LoadMore, cx);
             }
         }))
-        .child(div().w_full().px_4().pb_4().children(content_children))
+        .child(
+            div()
+                .id("gallery-content")
+                .w_full()
+                .px_4()
+                .pb_4()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _event: &MouseDownEvent, _, cx| {
+                        // Check if an item was clicked (item handlers set this flag)
+                        if !ITEM_CLICKED.swap(false, Ordering::SeqCst) {
+                            // No item was clicked, so this is a background click
+                            // Clear selection
+                            this.handle_action(GalleryAction::ClearSelection, cx);
+                        }
+                    }),
+                )
+                .children(content_children),
+        )
         .into_any_element()
 }
 
@@ -336,6 +370,8 @@ fn gallery_item(data: GalleryItemData, cx: &mut Context<TrayBin>) -> impl IntoEl
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(move |this, _event: &MouseDownEvent, _, cx| {
+                                // Mark that an item was clicked (prevent background deselection)
+                                ITEM_CLICKED.store(true, Ordering::SeqCst);
                                 // Checkbox click = toggle selection (append/remove like Ctrl+click)
                                 this.handle_action(
                                     GalleryAction::Select {
@@ -374,6 +410,8 @@ fn gallery_item(data: GalleryItemData, cx: &mut Context<TrayBin>) -> impl IntoEl
         .on_mouse_down(
             MouseButton::Right,
             cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                // Mark that an item was clicked (prevent background deselection)
+                ITEM_CLICKED.store(true, Ordering::SeqCst);
                 // If the clicked item is selected, show context menu for all selected
                 // Otherwise, show context menu for just the clicked item
                 let paths = if this.is_path_selected(&path_for_ctx) && this.has_selection() {
@@ -398,6 +436,9 @@ fn gallery_item(data: GalleryItemData, cx: &mut Context<TrayBin>) -> impl IntoEl
                 let drag_paths = drag_paths.clone();
                 let path_for_select = path.clone();
                 move |this, event: &MouseDownEvent, _, cx| {
+                    // Mark that an item was clicked (prevent background deselection)
+                    ITEM_CLICKED.store(true, Ordering::SeqCst);
+
                     if drag_paths.is_empty() {
                         return;
                     }

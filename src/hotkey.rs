@@ -22,6 +22,9 @@ static CURRENT_HOTKEY_ID: AtomicU32 = AtomicU32::new(0);
 /// Current registered hotkey (for unregistering)
 static CURRENT_HOTKEY: Mutex<Option<HotKey>> = Mutex::new(None);
 
+/// Message sender for sending UI messages
+static MESSAGE_SENDER: OnceLock<Sender<AppMessage>> = OnceLock::new();
+
 /// Thread-safe wrapper for GlobalHotKeyManager
 /// SAFETY: GlobalHotKeyManager must only be accessed from the main thread
 struct HotKeyManagerWrapper(GlobalHotKeyManager);
@@ -36,7 +39,7 @@ static HOTKEY_MANAGER: OnceLock<Mutex<HotKeyManagerWrapper>> = OnceLock::new();
 /// Initialize global hotkey manager with custom hotkey string
 /// IMPORTANT: Must be called from main thread before GPUI app starts
 /// The manager is stored globally for runtime hotkey updates
-pub fn init_global_hotkey(_message_tx: Sender<AppMessage>, hotkey_str: &str) -> bool {
+pub fn init_global_hotkey(message_tx: Sender<AppMessage>, hotkey_str: &str) -> bool {
     let manager = match GlobalHotKeyManager::new() {
         Ok(m) => m,
         Err(e) => {
@@ -74,6 +77,9 @@ pub fn init_global_hotkey(_message_tx: Sender<AppMessage>, hotkey_str: &str) -> 
     // Store manager globally for runtime updates
     let _ = HOTKEY_MANAGER.set(Mutex::new(HotKeyManagerWrapper(manager)));
 
+    // Store message sender globally
+    let _ = MESSAGE_SENDER.set(message_tx);
+
     // Handle hotkey events in a background thread
     // This thread checks CURRENT_HOTKEY_ID dynamically to support runtime changes
     std::thread::spawn(move || {
@@ -84,7 +90,13 @@ pub fn init_global_hotkey(_message_tx: Sender<AppMessage>, hotkey_str: &str) -> 
                 if event.id == current_id && event.state == HotKeyState::Pressed {
                     if HOTKEY_ENABLED.load(Ordering::SeqCst) {
                         info!("Global hotkey pressed - toggling window");
-                        toggle_window();
+                        let was_shown = toggle_window();
+                        // If window was shown, send message to reset to main view
+                        if was_shown {
+                            if let Some(sender) = MESSAGE_SENDER.get() {
+                                let _ = sender.send(AppMessage::ShowMainWindow);
+                            }
+                        }
                     } else {
                         warn!("Global hotkey pressed but disabled");
                     }

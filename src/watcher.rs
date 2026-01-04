@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::convert;
 use crate::organizer;
 use crate::settings::Settings;
 use crate::AppMessage;
@@ -161,49 +162,66 @@ impl ScreenshotWatcher {
                 EventKind::Create(_) => {
                     info!("New screenshot detected: {:?}", path);
 
-                    // Check if organizer is enabled
-                    let (organizer_enabled, organizer_format) = {
+                    // Check if organizer and/or auto-convert is enabled
+                    let (organizer_enabled, organizer_format, auto_convert, conversion_format, quality) = {
                         let s = settings.lock();
-                        (s.organizer_enabled, s.organizer_format.clone())
+                        (
+                            s.organizer_enabled,
+                            s.organizer_format.clone(),
+                            s.auto_convert_webp,
+                            s.conversion_format,
+                            s.webp_quality,
+                        )
                     };
 
-                    if organizer_enabled {
-                        // Organize the file (move to date-based subdirectory)
-                        let path_clone = path.clone();
-                        let base_dir = base_dir.to_path_buf();
-                        let tx = tx.clone();
+                    // Process in background thread
+                    let path_clone = path.clone();
+                    let base_dir = base_dir.to_path_buf();
+                    let tx = tx.clone();
 
-                        std::thread::spawn(move || {
-                            // Small delay to ensure file is fully written
-                            std::thread::sleep(Duration::from_millis(500));
+                    std::thread::spawn(move || {
+                        // Small delay to ensure file is fully written
+                        std::thread::sleep(Duration::from_millis(500));
 
+                        let mut current_path = path_clone.clone();
+
+                        // Step 1: Auto-convert if enabled (PNG -> WebP/JPEG)
+                        if auto_convert && convert::is_convertible(&current_path) {
+                            info!("Auto-converting screenshot: {:?}", current_path);
+                            match convert::convert_image(&current_path, conversion_format, quality) {
+                                Ok(new_path) => {
+                                    info!("Converted: {:?} -> {:?}", current_path, new_path);
+                                    current_path = new_path;
+                                }
+                                Err(e) => {
+                                    error!("Failed to convert screenshot: {}", e);
+                                }
+                            }
+                        }
+
+                        // Step 2: Organize if enabled (move to date-based subdirectory)
+                        if organizer_enabled {
                             match organizer::organize_file(
-                                &path_clone,
+                                &current_path,
                                 &base_dir,
                                 &organizer_format,
                             ) {
                                 Ok(Some(new_path)) => {
-                                    // File was moved, send the new path
-                                    info!(
-                                        "Organized screenshot: {:?} -> {:?}",
-                                        path_clone, new_path
-                                    );
-                                    let _ = tx.send(AppMessage::NewScreenshot(new_path));
+                                    info!("Organized: {:?} -> {:?}", current_path, new_path);
+                                    current_path = new_path;
                                 }
                                 Ok(None) => {
-                                    // File was already organized or in subdirectory
-                                    let _ = tx.send(AppMessage::NewScreenshot(path_clone));
+                                    // Already organized or in subdirectory
                                 }
                                 Err(e) => {
-                                    // Organization failed, send original path
                                     error!("Failed to organize screenshot: {}", e);
-                                    let _ = tx.send(AppMessage::NewScreenshot(path_clone));
                                 }
                             }
-                        });
-                    } else {
-                        let _ = tx.send(AppMessage::NewScreenshot(path.clone()));
-                    }
+                        }
+
+                        // Send final path to UI
+                        let _ = tx.send(AppMessage::NewScreenshot(current_path));
+                    });
                 }
                 EventKind::Remove(_) => {
                     info!("Screenshot removed: {:?}", path);

@@ -184,6 +184,8 @@ pub enum GalleryAction {
     StartDrag(Vec<PathBuf>),
     /// Load more items (infinite scroll)
     LoadMore,
+    /// Clear all selections (when clicking blank space)
+    ClearSelection,
 }
 
 /// Main application view
@@ -229,6 +231,15 @@ pub struct TrayBin {
 
     /// Current file being organized
     organize_current_file: String,
+
+    /// Whether we're currently converting files
+    converting: bool,
+
+    /// Conversion progress (current, total)
+    convert_progress: (usize, usize),
+
+    /// Current file being converted
+    convert_current_file: String,
 }
 
 impl TrayBin {
@@ -251,6 +262,9 @@ impl TrayBin {
             organizing: false,
             organize_progress: (0, 0),
             organize_current_file: String::new(),
+            converting: false,
+            convert_progress: (0, 0),
+            convert_current_file: String::new(),
         }
     }
 
@@ -362,6 +376,11 @@ impl TrayBin {
                     window.activate_window();
                     cx.notify();
                 }
+                AppMessage::ShowMainWindow => {
+                    info!("Show main window requested - closing settings if open");
+                    self.settings_open = false;
+                    cx.notify();
+                }
                 AppMessage::OpenSettings => {
                     self.settings_open = true;
                     cx.notify();
@@ -410,6 +429,25 @@ impl TrayBin {
                     self.organizing = false;
                     self.organize_progress = (0, 0);
                     self.organize_current_file = String::new();
+                    cx.notify();
+                }
+                AppMessage::ConvertStarted(total) => {
+                    info!("Conversion started: {} files", total);
+                    self.converting = true;
+                    self.convert_progress = (0, total);
+                    self.convert_current_file = String::new();
+                    cx.notify();
+                }
+                AppMessage::ConvertProgress(current, total, file) => {
+                    self.convert_progress = (current, total);
+                    self.convert_current_file = file;
+                    cx.notify();
+                }
+                AppMessage::ConvertCompleted => {
+                    info!("Conversion completed");
+                    self.converting = false;
+                    self.convert_progress = (0, 0);
+                    self.convert_current_file = String::new();
                     cx.notify();
                 }
             }
@@ -509,6 +547,13 @@ impl TrayBin {
             }
             GalleryAction::LoadMore => {
                 self.load_more(cx);
+            }
+            GalleryAction::ClearSelection => {
+                if !self.selected.is_empty() {
+                    self.selected.clear();
+                    self.last_selected = None;
+                    cx.notify();
+                }
             }
         }
     }
@@ -682,12 +727,22 @@ impl Render for TrayBin {
                 }
 
                 match event.keystroke.key.as_str() {
-                    // ESC - minimize window or cancel recording
+                    // ESC - clear selection, close settings, or minimize window
                     "escape" => {
                         if this.recording_hotkey {
                             this.recording_hotkey = false;
                             cx.notify();
+                        } else if !this.selected.is_empty() {
+                            // Clear selection if items are selected
+                            this.selected.clear();
+                            this.last_selected = None;
+                            cx.notify();
+                        } else if this.settings_open {
+                            // Close settings if open
+                            this.settings_open = false;
+                            cx.notify();
                         } else {
+                            // Minimize window
                             window.minimize_window();
                         }
                     }
@@ -1326,6 +1381,9 @@ impl TrayBin {
         let auto_convert = settings.auto_convert_webp;
         let format = settings.conversion_format;
         let quality = settings.webp_quality;
+        let converting = self.converting;
+        let convert_progress = self.convert_progress;
+        let convert_current_file = self.convert_current_file.clone();
 
         v_flex()
             .w_full()
@@ -1446,6 +1504,60 @@ impl TrayBin {
                     cx,
                 ),
             )
+            // Progress bar when converting
+            .when(converting, |el| {
+                let (current, total) = convert_progress;
+                let progress_pct = if total > 0 {
+                    (current as f32 / total as f32) * 100.0
+                } else {
+                    0.0
+                };
+                el.child(
+                    v_flex()
+                        .w_full()
+                        .gap_2()
+                        .mb_4()
+                        .child(
+                            // Progress bar container
+                            div()
+                                .w_full()
+                                .h(px(8.0))
+                                .rounded(px(4.0))
+                                .bg(cx.theme().muted)
+                                .overflow_hidden()
+                                .child(
+                                    div()
+                                        .h_full()
+                                        .w(relative(progress_pct / 100.0))
+                                        .bg(cx.theme().primary)
+                                        .rounded(px(4.0)),
+                                ),
+                        )
+                        .child(
+                            h_flex()
+                                .w_full()
+                                .justify_between()
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .max_w(px(200.0))
+                                        .overflow_x_hidden()
+                                        .child(if convert_current_file.is_empty() {
+                                            "Preparing...".to_string()
+                                        } else {
+                                            convert_current_file
+                                        }),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(format!("{}/{} files", current, total)),
+                                ),
+                        ),
+                )
+            })
     }
 
     fn render_hotkey_settings(

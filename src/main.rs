@@ -1,5 +1,6 @@
 // Hide console window by default (tray app), unless --console flag is used
 #![windows_subsystem = "windows"]
+#![recursion_limit = "256"]
 
 mod app;
 mod clipboard;
@@ -56,6 +57,8 @@ pub enum AppMessage {
     ScreenshotRemoved(PathBuf),
     /// Toggle window visibility (from tray click)
     ToggleWindow,
+    /// Show main window (not settings) from tray icon click
+    ShowMainWindow,
     /// Open settings
     OpenSettings,
     /// Change screenshot directory
@@ -68,6 +71,12 @@ pub enum AppMessage {
     OrganizeProgress(usize, usize, String),
     /// Organization completed
     OrganizeCompleted,
+    /// Conversion started with total file count
+    ConvertStarted(usize),
+    /// Conversion progress update (current, total, current_file)
+    ConvertProgress(usize, usize, String),
+    /// Conversion completed
+    ConvertCompleted,
     /// Quit application
     Quit,
 }

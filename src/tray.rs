@@ -175,20 +175,24 @@ pub fn show_window() {
 }
 
 /// Toggle window visibility - hide if focused, show if not
+/// Returns true if window was shown, false if hidden
 #[cfg(windows)]
-pub fn toggle_window() {
+pub fn toggle_window() -> bool {
     if is_window_focused() && is_window_visible() {
         info!("Window is focused, hiding");
         hide_window();
+        false
     } else {
         info!("Window is not focused or hidden, showing");
         show_window();
+        true
     }
 }
 
 #[cfg(not(windows))]
-pub fn toggle_window() {
+pub fn toggle_window() -> bool {
     show_window();
+    true
 }
 
 pub struct TrayManager {
@@ -256,7 +260,11 @@ impl TrayManager {
                             if TRAY_MOUSE_DOWN.load(Ordering::SeqCst) {
                                 TRAY_MOUSE_DOWN.store(false, Ordering::SeqCst);
                                 *TRAY_DRAG_START.lock() = None;
-                                toggle_window();
+                                let was_shown = toggle_window();
+                                // If window was shown, send message to reset to main view
+                                if was_shown {
+                                    let _ = click_tx.send(AppMessage::ShowMainWindow);
+                                }
                             }
                         }
                         TrayIconEvent::Move { position, .. } => {
