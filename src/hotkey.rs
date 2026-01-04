@@ -8,6 +8,7 @@ use global_hotkey::{
 use log::{error, info, warn};
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::OnceLock;
 
 use crate::tray::toggle_window;
 use crate::AppMessage;
@@ -15,37 +16,44 @@ use crate::AppMessage;
 /// Global flag to track if hotkey is enabled at runtime
 static HOTKEY_ENABLED: AtomicBool = AtomicBool::new(true);
 
-/// Current hotkey ID for event matching (0 means accept any)
+/// Current registered hotkey ID
 static CURRENT_HOTKEY_ID: AtomicU32 = AtomicU32::new(0);
 
-/// Flag to accept any hotkey event (used after re-registration)
-static ACCEPT_ANY_HOTKEY: AtomicBool = AtomicBool::new(false);
+/// Current registered hotkey (for unregistering)
+static CURRENT_HOTKEY: Mutex<Option<HotKey>> = Mutex::new(None);
 
-/// Pending hotkey update request
-static PENDING_HOTKEY: Mutex<Option<String>> = Mutex::new(None);
+/// Thread-safe wrapper for GlobalHotKeyManager
+/// SAFETY: GlobalHotKeyManager must only be accessed from the main thread
+struct HotKeyManagerWrapper(GlobalHotKeyManager);
+
+// SAFETY: We ensure all access happens on the main thread via message passing
+unsafe impl Send for HotKeyManagerWrapper {}
+unsafe impl Sync for HotKeyManagerWrapper {}
+
+/// Global manager reference for runtime hotkey updates
+static HOTKEY_MANAGER: OnceLock<Mutex<HotKeyManagerWrapper>> = OnceLock::new();
 
 /// Initialize global hotkey manager with custom hotkey string
-pub fn init_global_hotkey(
-    _message_tx: Sender<AppMessage>,
-    hotkey_str: &str,
-) -> Option<GlobalHotKeyManager> {
+/// IMPORTANT: Must be called from main thread before GPUI app starts
+/// The manager is stored globally for runtime hotkey updates
+pub fn init_global_hotkey(_message_tx: Sender<AppMessage>, hotkey_str: &str) -> bool {
     let manager = match GlobalHotKeyManager::new() {
         Ok(m) => m,
         Err(e) => {
             error!("Failed to create global hotkey manager: {:?}", e);
-            return None;
+            return false;
         }
     };
 
-    // Parse and register the hotkey
+    // Parse the hotkey string
     let (modifiers, code) = match parse_hotkey_string(hotkey_str) {
         Some((m, c)) => (m, c),
         None => {
             warn!(
-                "Invalid hotkey string '{}', using default Ctrl+Alt+S",
+                "Invalid hotkey string '{}', using default Ctrl+Shift+S",
                 hotkey_str
             );
-            (Modifiers::CONTROL | Modifiers::ALT, Code::KeyS)
+            (Modifiers::CONTROL | Modifiers::SHIFT, Code::KeyS)
         }
     };
 
@@ -53,22 +61,27 @@ pub fn init_global_hotkey(
 
     if let Err(e) = manager.register(hotkey) {
         error!("Failed to register hotkey {}: {:?}", hotkey_str, e);
-        return None;
+        return false;
     }
 
     info!("Registered global hotkey: {}", hotkey_str);
-    CURRENT_HOTKEY_ID.store(hotkey.id(), Ordering::SeqCst);
 
-    // Start event listener thread
+    // Store the hotkey ID and hotkey for later updates
+    let hotkey_id = hotkey.id();
+    CURRENT_HOTKEY_ID.store(hotkey_id, Ordering::SeqCst);
+    *CURRENT_HOTKEY.lock() = Some(hotkey);
+
+    // Store manager globally for runtime updates
+    let _ = HOTKEY_MANAGER.set(Mutex::new(HotKeyManagerWrapper(manager)));
+
+    // Handle hotkey events in a background thread
+    // This thread checks CURRENT_HOTKEY_ID dynamically to support runtime changes
     std::thread::spawn(move || {
         let receiver = GlobalHotKeyEvent::receiver();
         loop {
             if let Ok(event) = receiver.recv() {
-                // Check if this is our hotkey or if we're accepting any
                 let current_id = CURRENT_HOTKEY_ID.load(Ordering::SeqCst);
-                let accept_any = ACCEPT_ANY_HOTKEY.load(Ordering::SeqCst);
-
-                if event.state == HotKeyState::Pressed && (event.id == current_id || accept_any) {
+                if event.id == current_id && event.state == HotKeyState::Pressed {
                     if HOTKEY_ENABLED.load(Ordering::SeqCst) {
                         info!("Global hotkey pressed - toggling window");
                         toggle_window();
@@ -80,59 +93,67 @@ pub fn init_global_hotkey(
         }
     });
 
-    Some(manager)
+    true
 }
 
 /// Update the global hotkey to a new key combination
-/// Note: Due to thread-safety issues with GlobalHotKeyManager, this requires an app restart
-/// to fully take effect. The new hotkey is saved and will be used on next startup.
+/// This performs runtime re-registration of the hotkey
 pub fn update_hotkey(new_hotkey_str: &str) -> bool {
-    info!(
-        "Hotkey change requested to: {} (requires app restart for full effect)",
-        new_hotkey_str
-    );
+    info!("Updating hotkey to: {}", new_hotkey_str);
 
-    // Store the pending hotkey
-    *PENDING_HOTKEY.lock() = Some(new_hotkey_str.to_string());
-
-    // For now, we'll try to register with a new manager on the main thread
-    // This may or may not work depending on the Windows message loop
-    match GlobalHotKeyManager::new() {
-        Ok(manager) => {
-            let (modifiers, code) = match parse_hotkey_string(new_hotkey_str) {
-                Some((m, c)) => (m, c),
-                None => {
-                    error!("Invalid hotkey string: {}", new_hotkey_str);
-                    return false;
-                }
-            };
-
-            let hotkey = HotKey::new(Some(modifiers), code);
-
-            if let Err(e) = manager.register(hotkey) {
-                error!("Failed to register new hotkey: {:?}", e);
-                return false;
-            }
-
-            // Update the ID and accept any hotkey temporarily
-            CURRENT_HOTKEY_ID.store(hotkey.id(), Ordering::SeqCst);
-            ACCEPT_ANY_HOTKEY.store(true, Ordering::SeqCst);
-
-            info!("New hotkey registered: {}", new_hotkey_str);
-
-            // Keep the manager alive by leaking it (not ideal but works)
-            std::mem::forget(manager);
-
-            true
+    // Parse the new hotkey string
+    let (modifiers, code) = match parse_hotkey_string(new_hotkey_str) {
+        Some((m, c)) => (m, c),
+        None => {
+            error!("Invalid hotkey string: {}", new_hotkey_str);
+            return false;
         }
-        Err(e) => {
-            error!("Failed to create hotkey manager: {:?}", e);
-            false
+    };
+
+    let new_hotkey = HotKey::new(Some(modifiers), code);
+
+    // Get the manager
+    let manager_cell = match HOTKEY_MANAGER.get() {
+        Some(m) => m,
+        None => {
+            error!("Hotkey manager not initialized");
+            return false;
+        }
+    };
+
+    let mut manager_guard = manager_cell.lock();
+    let manager = &mut manager_guard.0;
+
+    // Unregister the old hotkey
+    {
+        let mut old_hotkey_guard = CURRENT_HOTKEY.lock();
+        if let Some(old_hotkey) = old_hotkey_guard.take() {
+            if let Err(e) = manager.unregister(old_hotkey) {
+                warn!("Failed to unregister old hotkey: {:?}", e);
+                // Continue anyway - might already be unregistered
+            } else {
+                info!("Unregistered old hotkey");
+            }
         }
     }
+
+    // Register the new hotkey
+    if let Err(e) = manager.register(new_hotkey) {
+        error!("Failed to register new hotkey {}: {:?}", new_hotkey_str, e);
+        return false;
+    }
+
+    // Update the stored hotkey info
+    let new_id = new_hotkey.id();
+    CURRENT_HOTKEY_ID.store(new_id, Ordering::SeqCst);
+    *CURRENT_HOTKEY.lock() = Some(new_hotkey);
+
+    info!("Successfully updated hotkey to: {}", new_hotkey_str);
+    true
 }
 
 /// Enable or disable the hotkey
+#[allow(dead_code)]
 pub fn set_hotkey_enabled(enabled: bool) {
     HOTKEY_ENABLED.store(enabled, Ordering::SeqCst);
     info!("Hotkey enabled: {}", enabled);

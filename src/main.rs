@@ -152,12 +152,13 @@ fn main() -> Result<()> {
     // Initialize global hotkey with custom setting
     let hotkey_message_tx = message_tx.clone();
     let hotkey_str = settings.hotkey.clone();
-    let _hotkey_manager = if settings.hotkey_enabled {
-        init_global_hotkey(hotkey_message_tx, &hotkey_str)
+    if settings.hotkey_enabled {
+        if !init_global_hotkey(hotkey_message_tx, &hotkey_str) {
+            warn!("Failed to initialize global hotkey");
+        }
     } else {
         info!("Global hotkey disabled in settings");
-        None
-    };
+    }
 
     // Start file watcher in background thread
     let watcher_tx = message_tx.clone();

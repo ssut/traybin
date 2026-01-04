@@ -3,21 +3,37 @@
 use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_component::button::{Button, ButtonVariants};
-use gpui_component::scroll::ScrollableElement;
-use gpui_component::slider::{Slider, SliderEvent, SliderState};
-use gpui_component::{h_flex, v_flex, ActiveTheme, StyledExt};
+use gpui_component::notification::{Notification, NotificationType};
+use gpui_component::switch::Switch;
+use gpui_component::WindowExt;
+use gpui_component::{h_flex, v_flex, ActiveTheme, Sizable};
 use log::info;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::SystemTime;
 
+/// Settings page tabs
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum SettingsPage {
+    #[default]
+    General,
+    Conversion,
+    Hotkey,
+    About,
+}
+
 use crate::clipboard;
 use crate::convert;
-use crate::settings::{ConversionFormat, Settings};
+use crate::settings::ConversionFormat;
 use crate::thumbnail::ThumbnailCache;
 use crate::ui::gallery;
 use crate::{set_latest_screenshot, AppMessage, AppState};
+
+/// App version
+const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+/// App name
+const APP_NAME: &str = "TrayBin";
 
 /// Start native window drag using Windows API
 #[cfg(windows)]
@@ -189,6 +205,9 @@ pub struct TrayBin {
     /// Whether settings panel is open
     settings_open: bool,
 
+    /// Current settings page
+    settings_page: SettingsPage,
+
     /// Current grid columns
     grid_columns: u32,
 
@@ -197,12 +216,6 @@ pub struct TrayBin {
 
     /// Focus handle for keyboard events
     focus_handle: FocusHandle,
-
-    /// Slider state for thumbnail size
-    thumbnail_slider: Entity<SliderState>,
-
-    /// Slider state for WebP quality
-    quality_slider: Entity<SliderState>,
 
     /// Whether we're recording a new hotkey
     recording_hotkey: bool,
@@ -213,53 +226,6 @@ impl TrayBin {
         let app_state = cx.global::<AppState>();
         let settings = app_state.settings.lock().clone();
 
-        // Create slider for thumbnail size (80-300px)
-        let thumbnail_slider = cx.new(|_| {
-            SliderState::new()
-                .min(80.0)
-                .max(300.0)
-                .default_value(settings.thumbnail_size as f32)
-                .step(10.0)
-        });
-
-        // Create slider for WebP quality (1-100)
-        let quality_slider = cx.new(|_| {
-            SliderState::new()
-                .min(1.0)
-                .max(100.0)
-                .default_value(settings.webp_quality as f32)
-                .step(5.0)
-        });
-
-        // Subscribe to thumbnail slider changes
-        cx.subscribe(&thumbnail_slider, |this, _, event: &SliderEvent, cx| {
-            let SliderEvent::Change(value) = event;
-            let new_size = value.start() as u32;
-            this.thumbnail_size = new_size;
-            {
-                let app_state = cx.global::<AppState>();
-                let mut settings = app_state.settings.lock();
-                settings.thumbnail_size = new_size;
-                let _ = settings.save();
-            }
-            cx.notify();
-        })
-        .detach();
-
-        // Subscribe to quality slider changes
-        cx.subscribe(&quality_slider, |_this, _, event: &SliderEvent, cx| {
-            let SliderEvent::Change(value) = event;
-            let new_quality = value.start() as u32;
-            {
-                let app_state = cx.global::<AppState>();
-                let mut settings = app_state.settings.lock();
-                settings.webp_quality = new_quality;
-                let _ = settings.save();
-            }
-            cx.notify();
-        })
-        .detach();
-
         Self {
             all_screenshots: Vec::new(),
             visible_count: PAGE_SIZE,
@@ -267,11 +233,10 @@ impl TrayBin {
             last_selected: None,
             thumbnail_cache: Arc::new(ThumbnailCache::new(500)),
             settings_open: false,
+            settings_page: SettingsPage::default(),
             grid_columns: settings.grid_columns,
             thumbnail_size: settings.thumbnail_size,
             focus_handle: cx.focus_handle(),
-            thumbnail_slider,
-            quality_slider,
             recording_hotkey: false,
         }
     }
@@ -698,8 +663,21 @@ impl Render for TrayBin {
                     "c" if event.keystroke.modifiers.control => {
                         if !this.selected.is_empty() {
                             let files: Vec<_> = this.selected.iter().cloned().collect();
+                            let count = files.len();
                             if clipboard::copy_files_to_clipboard(&files) {
-                                info!("Copied {} files to clipboard", files.len());
+                                info!("Copied {} files to clipboard", count);
+                                // Show toast notification
+                                let message = if count == 1 {
+                                    "1 item copied to clipboard".to_string()
+                                } else {
+                                    format!("{} items copied to clipboard", count)
+                                };
+                                window.push_notification(
+                                    Notification::new()
+                                        .message(message)
+                                        .with_type(NotificationType::Success),
+                                    cx,
+                                );
                             }
                         }
                     }
@@ -876,52 +854,435 @@ impl TrayBin {
     fn render_settings(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let app_state = cx.global::<AppState>();
         let settings = app_state.settings.lock().clone();
-        let auto_convert = settings.auto_convert_webp;
-        let conversion_format = settings.conversion_format;
-        let thumbnail_size = self.thumbnail_size;
-        let quality = settings.webp_quality;
-        let hotkey_str = settings.hotkey.clone();
-        let recording_hotkey = self.recording_hotkey;
+        let current_page = self.settings_page;
 
-        v_flex()
+        h_flex()
             .size_full()
-            .p_4()
-            .gap_4()
-            .overflow_y_scrollbar()
+            // Sidebar
+            .child(
+                v_flex()
+                    .w(px(160.0))
+                    .min_w(px(160.0))
+                    .max_w(px(160.0))
+                    .h_full()
+                    .py_2()
+                    .px_2()
+                    .overflow_hidden()
+                    .border_r_1()
+                    .border_color(cx.theme().border)
+                    .bg(cx.theme().background)
+                    .child(self.render_settings_tab(
+                        "General",
+                        SettingsPage::General,
+                        current_page,
+                        cx,
+                    ))
+                    .child(self.render_settings_tab(
+                        "Conversion",
+                        SettingsPage::Conversion,
+                        current_page,
+                        cx,
+                    ))
+                    .child(self.render_settings_tab(
+                        "Hotkey",
+                        SettingsPage::Hotkey,
+                        current_page,
+                        cx,
+                    ))
+                    .child(self.render_settings_tab(
+                        "About",
+                        SettingsPage::About,
+                        current_page,
+                        cx,
+                    )),
+            )
+            // Content area
+            .child(
+                div()
+                    .id("settings-content")
+                    .flex_1()
+                    .h_full()
+                    .overflow_scroll()
+                    .p_4()
+                    .child(match current_page {
+                        SettingsPage::General => self
+                            .render_general_settings(&settings, cx)
+                            .into_any_element(),
+                        SettingsPage::Conversion => self
+                            .render_conversion_settings(&settings, cx)
+                            .into_any_element(),
+                        SettingsPage::Hotkey => self
+                            .render_hotkey_settings(&settings, cx)
+                            .into_any_element(),
+                        SettingsPage::About => self.render_about_settings(cx).into_any_element(),
+                    }),
+            )
+    }
+
+    fn render_settings_tab(
+        &self,
+        label: &'static str,
+        page: SettingsPage,
+        current: SettingsPage,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let is_active = page == current;
+        div()
+            .id(SharedString::from(format!("tab-{}", label.to_lowercase())))
+            .w_full()
+            .px_3()
+            .py_2()
+            .cursor_pointer()
+            .text_sm()
+            .rounded(px(6.0))
+            .mb_1()
+            .when(is_active, |s| {
+                s.bg(cx.theme().primary)
+                    .text_color(cx.theme().primary_foreground)
+                    .font_weight(FontWeight::MEDIUM)
+            })
+            .when(!is_active, |s| {
+                s.text_color(cx.theme().foreground)
+                    .hover(|s| s.bg(cx.theme().muted))
+            })
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.settings_page = page;
+                cx.notify();
+            }))
+            .child(label)
+    }
+
+    fn render_setting_row(
+        &self,
+        label: &str,
+        description: Option<&str>,
+        control: impl IntoElement,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        v_flex()
+            .w_full()
+            .gap_1()
+            .mb_4()
             .child(
                 h_flex()
                     .w_full()
                     .justify_between()
+                    .items_center()
                     .child(
                         div()
-                            .text_lg()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child("Settings"),
+                            .text_sm()
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(cx.theme().foreground)
+                            .child(label.to_string()),
+                    )
+                    .child(control),
+            )
+            .when_some(description, |s, desc| {
+                s.child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(desc.to_string()),
+                )
+            })
+    }
+
+    fn render_section_header(&self, title: &str, cx: &Context<Self>) -> impl IntoElement {
+        div()
+            .text_base()
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_color(cx.theme().foreground)
+            .mb_3()
+            .child(title.to_string())
+    }
+
+    fn render_general_settings(
+        &self,
+        settings: &crate::settings::Settings,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let screenshot_dir = settings.screenshot_directory.to_string_lossy().to_string();
+        let thumbnail_size = self.thumbnail_size;
+
+        v_flex()
+            .w_full()
+            .gap_2()
+            // Screenshot Directory
+            .child(self.render_section_header("Screenshot Directory", cx))
+            .child(
+                h_flex()
+                    .w_full()
+                    .gap_2()
+                    .items_center()
+                    .mb_4()
+                    .child(
+                        div()
+                            .flex_1()
+                            .px_3()
+                            .py_2()
+                            .rounded(px(6.0))
+                            .bg(cx.theme().muted)
+                            .text_sm()
+                            .text_color(cx.theme().muted_foreground)
+                            .overflow_x_hidden()
+                            .child(screenshot_dir),
                     )
                     .child(
-                        Button::new("back")
-                            .label("Go back")
-                            .ghost()
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.settings_open = false;
-                                cx.notify();
-                            })),
+                        Button::new("browse-dir")
+                            .label("Browse...")
+                            .small()
+                            .outline()
+                            .on_click(|_, _, cx| {
+                                let tx = {
+                                    let app_state = cx.global::<AppState>();
+                                    app_state.message_tx.clone()
+                                };
+                                std::thread::spawn(move || {
+                                    if let Some(path) = pick_folder() {
+                                        let _ = tx.send(AppMessage::ChangeDirectory(path));
+                                    }
+                                });
+                            }),
                     ),
             )
+            // Display Settings
+            .child(self.render_section_header("Display", cx))
+            .child(
+                self.render_setting_row(
+                    "Thumbnail Size",
+                    Some("Size of thumbnails in pixels (80-300)"),
+                    h_flex()
+                        .gap_2()
+                        .items_center()
+                        .child(
+                            Button::new("thumb-minus")
+                                .ghost()
+                                .compact()
+                                .label("-")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    let new_size = (this.thumbnail_size as i32 - 10).max(80) as u32;
+                                    this.thumbnail_size = new_size;
+                                    {
+                                        let app_state = cx.global::<AppState>();
+                                        let mut settings = app_state.settings.lock();
+                                        settings.thumbnail_size = new_size;
+                                        let _ = settings.save();
+                                    }
+                                    cx.notify();
+                                })),
+                        )
+                        .child(
+                            div()
+                                .w(px(60.0))
+                                .text_center()
+                                .px_2()
+                                .py_1()
+                                .rounded(px(4.0))
+                                .bg(cx.theme().muted)
+                                .text_sm()
+                                .child(format!("{}px", thumbnail_size)),
+                        )
+                        .child(
+                            Button::new("thumb-plus")
+                                .ghost()
+                                .compact()
+                                .label("+")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    let new_size = (this.thumbnail_size + 10).min(300);
+                                    this.thumbnail_size = new_size;
+                                    {
+                                        let app_state = cx.global::<AppState>();
+                                        let mut settings = app_state.settings.lock();
+                                        settings.thumbnail_size = new_size;
+                                        let _ = settings.save();
+                                    }
+                                    cx.notify();
+                                })),
+                        ),
+                    cx,
+                ),
+            )
+    }
+
+    fn render_conversion_settings(
+        &self,
+        settings: &crate::settings::Settings,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let auto_convert = settings.auto_convert_webp;
+        let format = settings.conversion_format;
+        let quality = settings.webp_quality;
+
+        v_flex()
+            .w_full()
+            .gap_2()
+            .child(self.render_section_header("Auto Conversion", cx))
+            // Auto-convert toggle
+            .child(
+                self.render_setting_row(
+                    "Auto-convert Screenshots",
+                    Some("Automatically convert new PNG screenshots to WebP/JPEG"),
+                    Switch::new("auto-convert")
+                        .checked(auto_convert)
+                        .on_click(cx.listener(|_this, checked: &bool, _, cx| {
+                            {
+                                let app_state = cx.global::<AppState>();
+                                let mut settings = app_state.settings.lock();
+                                settings.auto_convert_webp = *checked;
+                                let _ = settings.save();
+                            }
+                            cx.notify();
+                        })),
+                    cx,
+                ),
+            )
+            // Format selection
+            .child(
+                self.render_setting_row(
+                    "Conversion Format",
+                    Some("Target format for conversion"),
+                    h_flex()
+                        .gap_1()
+                        .child(
+                            Button::new("fmt-webp")
+                                .small()
+                                .when(format == ConversionFormat::WebP, |s| s.primary())
+                                .when(format != ConversionFormat::WebP, |s| s.outline())
+                                .label("WebP")
+                                .on_click(cx.listener(|_this, _, _, cx| {
+                                    {
+                                        let app_state = cx.global::<AppState>();
+                                        let mut settings = app_state.settings.lock();
+                                        settings.conversion_format = ConversionFormat::WebP;
+                                        let _ = settings.save();
+                                    }
+                                    cx.notify();
+                                })),
+                        )
+                        .child(
+                            Button::new("fmt-jpeg")
+                                .small()
+                                .when(format == ConversionFormat::Jpeg, |s| s.primary())
+                                .when(format != ConversionFormat::Jpeg, |s| s.outline())
+                                .label("JPEG")
+                                .on_click(cx.listener(|_this, _, _, cx| {
+                                    {
+                                        let app_state = cx.global::<AppState>();
+                                        let mut settings = app_state.settings.lock();
+                                        settings.conversion_format = ConversionFormat::Jpeg;
+                                        let _ = settings.save();
+                                    }
+                                    cx.notify();
+                                })),
+                        ),
+                    cx,
+                ),
+            )
+            // Quality
+            .child(
+                self.render_setting_row(
+                    "Quality",
+                    Some("Image quality (1-100, higher is better)"),
+                    h_flex()
+                        .gap_2()
+                        .items_center()
+                        .child(
+                            Button::new("qual-minus")
+                                .ghost()
+                                .compact()
+                                .label("-")
+                                .on_click(cx.listener(|_this, _, _, cx| {
+                                    {
+                                        let app_state = cx.global::<AppState>();
+                                        let mut settings = app_state.settings.lock();
+                                        settings.webp_quality =
+                                            (settings.webp_quality as i32 - 5).max(1) as u32;
+                                        let _ = settings.save();
+                                    }
+                                    cx.notify();
+                                })),
+                        )
+                        .child(
+                            div()
+                                .w(px(50.0))
+                                .text_center()
+                                .px_2()
+                                .py_1()
+                                .rounded(px(4.0))
+                                .bg(cx.theme().muted)
+                                .text_sm()
+                                .child(format!("{}", quality)),
+                        )
+                        .child(
+                            Button::new("qual-plus")
+                                .ghost()
+                                .compact()
+                                .label("+")
+                                .on_click(cx.listener(|_this, _, _, cx| {
+                                    {
+                                        let app_state = cx.global::<AppState>();
+                                        let mut settings = app_state.settings.lock();
+                                        settings.webp_quality =
+                                            (settings.webp_quality + 5).min(100);
+                                        let _ = settings.save();
+                                    }
+                                    cx.notify();
+                                })),
+                        ),
+                    cx,
+                ),
+            )
+    }
+
+    fn render_hotkey_settings(
+        &self,
+        settings: &crate::settings::Settings,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let hotkey_enabled = settings.hotkey_enabled;
+        let hotkey_str = settings.hotkey.clone();
+        let recording = self.recording_hotkey;
+
+        v_flex()
+            .w_full()
+            .gap_2()
+            .child(self.render_section_header("Global Hotkey", cx))
+            // Enable toggle
+            .child(
+                self.render_setting_row(
+                    "Enable Global Hotkey",
+                    Some("Press hotkey to show/hide window"),
+                    Switch::new("hotkey-enable")
+                        .checked(hotkey_enabled)
+                        .on_click(cx.listener(|_this, checked: &bool, _, cx| {
+                            {
+                                let app_state = cx.global::<AppState>();
+                                let mut settings = app_state.settings.lock();
+                                settings.hotkey_enabled = *checked;
+                                let _ = settings.save();
+                            }
+                            cx.notify();
+                        })),
+                    cx,
+                ),
+            )
+            // Current hotkey display + record button
             .child(
                 v_flex()
-                    .gap_6()
                     .w_full()
-                    .max_w(px(600.0))
-                    // Screenshot Directory with Browse button
+                    .gap_2()
+                    .mb_4()
                     .child(
-                        v_flex()
-                            .gap_2()
+                        h_flex()
+                            .w_full()
+                            .justify_between()
+                            .items_center()
                             .child(
                                 div()
                                     .text_sm()
                                     .font_weight(FontWeight::MEDIUM)
-                                    .child("Screenshot Directory"),
+                                    .text_color(cx.theme().foreground)
+                                    .child("Current Hotkey"),
                             )
                             .child(
                                 h_flex()
@@ -929,427 +1290,115 @@ impl TrayBin {
                                     .items_center()
                                     .child(
                                         div()
-                                            .flex_1()
                                             .px_3()
-                                            .py_2()
+                                            .py_1()
                                             .rounded(px(6.0))
-                                            .bg(cx.theme().muted)
+                                            .bg(if recording {
+                                                cx.theme().primary
+                                            } else {
+                                                cx.theme().muted
+                                            })
                                             .text_sm()
-                                            .text_color(cx.theme().muted_foreground)
-                                            .overflow_hidden()
-                                            .child(
-                                                settings
-                                                    .screenshot_directory
-                                                    .to_string_lossy()
-                                                    .to_string(),
-                                            ),
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(if recording {
+                                                cx.theme().primary_foreground
+                                            } else {
+                                                cx.theme().foreground
+                                            })
+                                            .child(if recording {
+                                                "Press any key...".to_string()
+                                            } else {
+                                                hotkey_str
+                                            }),
                                     )
                                     .child(
-                                        Button::new("browse-dir")
-                                            .label("Browse...")
-                                            .ghost()
-                                            .on_click(cx.listener(|_this, _, _, cx| {
-                                                // Open folder picker in a thread to avoid blocking
-                                                let tx = {
-                                                    let app_state = cx.global::<AppState>();
-                                                    app_state.message_tx.clone()
-                                                };
-                                                std::thread::spawn(move || {
-                                                    if let Some(path) = pick_folder() {
-                                                        let _ = tx.send(
-                                                            AppMessage::ChangeDirectory(path),
-                                                        );
-                                                    }
-                                                });
+                                        Button::new("record-hotkey")
+                                            .small()
+                                            .when(recording, |s| s.danger())
+                                            .when(!recording, |s| s.outline())
+                                            .label(if recording { "Cancel" } else { "Record" })
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.recording_hotkey = !this.recording_hotkey;
+                                                cx.notify();
                                             })),
                                     ),
                             ),
                     )
-                    // Thumbnail Size with Slider
                     .child(
-                        v_flex()
-                            .gap_2()
-                            .child(
-                                h_flex()
-                                    .justify_between()
-                                    .child(
-                                        div()
-                                            .text_sm()
-                                            .font_weight(FontWeight::MEDIUM)
-                                            .child("Thumbnail Size"),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_sm()
-                                            .text_color(cx.theme().muted_foreground)
-                                            .child(format!("{}px", thumbnail_size)),
-                                    ),
-                            )
-                            .child(Slider::new(&self.thumbnail_slider)),
-                    )
-                    // Auto-convert toggle
-                    .child(
-                        h_flex()
-                            .id("convert-toggle")
-                            .gap_3()
-                            .items_center()
-                            .cursor_pointer()
-                            .on_click(cx.listener(|_this, _, _, cx| {
-                                {
-                                    let app_state = cx.global::<AppState>();
-                                    let mut settings = app_state.settings.lock();
-                                    settings.auto_convert_webp = !settings.auto_convert_webp;
-                                    let _ = settings.save();
-                                }
-                                cx.notify();
-                            }))
-                            .child(
-                                div()
-                                    .w(px(20.0))
-                                    .h(px(20.0))
-                                    .rounded(px(4.0))
-                                    .border_2()
-                                    .border_color(if auto_convert {
-                                        cx.theme().primary
-                                    } else {
-                                        cx.theme().border
-                                    })
-                                    .bg(if auto_convert {
-                                        cx.theme().primary
-                                    } else {
-                                        cx.theme().background
-                                    })
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .when(auto_convert, |this: Div| {
-                                        this.child(
-                                            div()
-                                                .text_color(cx.theme().primary_foreground)
-                                                .text_xs()
-                                                .child("✓"),
-                                        )
-                                    }),
-                            )
-                            .child(
-                                v_flex()
-                                    .child(
-                                        div()
-                                            .text_sm()
-                                            .font_weight(FontWeight::MEDIUM)
-                                            .child("Auto-convert Screenshots"),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(cx.theme().muted_foreground)
-                                            .child("Automatically convert new PNG screenshots"),
-                                    ),
-                            ),
-                    )
-                    // Conversion format selector (only show if auto-convert enabled)
-                    .when(auto_convert, |this: Div| {
-                        this.child(
-                            v_flex()
-                                .gap_2()
-                                .child(
-                                    div()
-                                        .text_sm()
-                                        .font_weight(FontWeight::MEDIUM)
-                                        .child("Conversion Format"),
-                                )
-                                .child(
-                                    h_flex()
-                                        .gap_2()
-                                        // WebP button
-                                        .child(
-                                            div()
-                                                .id("format-webp")
-                                                .px_4()
-                                                .py_2()
-                                                .rounded(px(6.0))
-                                                .cursor_pointer()
-                                                .border_2()
-                                                .border_color(
-                                                    if conversion_format == ConversionFormat::WebP {
-                                                        cx.theme().primary
-                                                    } else {
-                                                        cx.theme().border
-                                                    },
-                                                )
-                                                .bg(
-                                                    if conversion_format == ConversionFormat::WebP {
-                                                        cx.theme().primary
-                                                    } else {
-                                                        cx.theme().background
-                                                    },
-                                                )
-                                                .text_color(
-                                                    if conversion_format == ConversionFormat::WebP {
-                                                        cx.theme().primary_foreground
-                                                    } else {
-                                                        cx.theme().foreground
-                                                    },
-                                                )
-                                                .text_sm()
-                                                .on_click(cx.listener(|_this, _, _, cx| {
-                                                    {
-                                                        let app_state = cx.global::<AppState>();
-                                                        let mut settings =
-                                                            app_state.settings.lock();
-                                                        settings.conversion_format =
-                                                            ConversionFormat::WebP;
-                                                        let _ = settings.save();
-                                                    }
-                                                    cx.notify();
-                                                }))
-                                                .child("WebP"),
-                                        )
-                                        // JPEG button
-                                        .child(
-                                            div()
-                                                .id("format-jpeg")
-                                                .px_4()
-                                                .py_2()
-                                                .rounded(px(6.0))
-                                                .cursor_pointer()
-                                                .border_2()
-                                                .border_color(
-                                                    if conversion_format == ConversionFormat::Jpeg {
-                                                        cx.theme().primary
-                                                    } else {
-                                                        cx.theme().border
-                                                    },
-                                                )
-                                                .bg(
-                                                    if conversion_format == ConversionFormat::Jpeg {
-                                                        cx.theme().primary
-                                                    } else {
-                                                        cx.theme().background
-                                                    },
-                                                )
-                                                .text_color(
-                                                    if conversion_format == ConversionFormat::Jpeg {
-                                                        cx.theme().primary_foreground
-                                                    } else {
-                                                        cx.theme().foreground
-                                                    },
-                                                )
-                                                .text_sm()
-                                                .on_click(cx.listener(|_this, _, _, cx| {
-                                                    {
-                                                        let app_state = cx.global::<AppState>();
-                                                        let mut settings =
-                                                            app_state.settings.lock();
-                                                        settings.conversion_format =
-                                                            ConversionFormat::Jpeg;
-                                                        let _ = settings.save();
-                                                    }
-                                                    cx.notify();
-                                                }))
-                                                .child("JPEG"),
-                                        ),
-                                ),
-                        )
-                    })
-                    // Quality slider (only show if auto-convert enabled)
-                    .when(auto_convert, |this: Div| {
-                        this.child(
-                            v_flex()
-                                .gap_2()
-                                .child(
-                                    h_flex()
-                                        .justify_between()
-                                        .child(
-                                            div()
-                                                .text_sm()
-                                                .font_weight(FontWeight::MEDIUM)
-                                                .child("Quality"),
-                                        )
-                                        .child(
-                                            div()
-                                                .text_sm()
-                                                .text_color(cx.theme().muted_foreground)
-                                                .child(format!("{}", quality)),
-                                        ),
-                                )
-                                .child(Slider::new(&self.quality_slider)),
-                        )
-                    })
-                    // Global Hotkey section
-                    .child(
-                        v_flex()
-                            .gap_2()
-                            .child(
-                                h_flex()
-                                    .id("hotkey-toggle")
-                                    .gap_3()
-                                    .items_center()
-                                    .cursor_pointer()
-                                    .on_click(cx.listener(|_this, _, _, cx| {
-                                        {
-                                            let app_state = cx.global::<AppState>();
-                                            let mut settings = app_state.settings.lock();
-                                            settings.hotkey_enabled = !settings.hotkey_enabled;
-                                            let _ = settings.save();
-                                        }
-                                        cx.notify();
-                                    }))
-                                    .child({
-                                        let hotkey_enabled = settings.hotkey_enabled;
-                                        div()
-                                            .w(px(20.0))
-                                            .h(px(20.0))
-                                            .rounded(px(4.0))
-                                            .border_2()
-                                            .border_color(if hotkey_enabled {
-                                                cx.theme().primary
-                                            } else {
-                                                cx.theme().border
-                                            })
-                                            .bg(if hotkey_enabled {
-                                                cx.theme().primary
-                                            } else {
-                                                cx.theme().background
-                                            })
-                                            .flex()
-                                            .items_center()
-                                            .justify_center()
-                                            .when(hotkey_enabled, |this: Div| {
-                                                this.child(
-                                                    div()
-                                                        .text_color(cx.theme().primary_foreground)
-                                                        .text_xs()
-                                                        .child("✓"),
-                                                )
-                                            })
-                                    })
-                                    .child(
-                                        v_flex()
-                                            .child(
-                                                div()
-                                                    .text_sm()
-                                                    .font_weight(FontWeight::MEDIUM)
-                                                    .child("Global Hotkey"),
-                                            )
-                                            .child(
-                                                div()
-                                                    .text_xs()
-                                                    .text_color(cx.theme().muted_foreground)
-                                                    .child("Press hotkey to show window"),
-                                            ),
-                                    ),
-                            )
-                            // Hotkey input with Record button
-                            .when(settings.hotkey_enabled, |this: Div| {
-                                this.child(
-                                    v_flex()
-                                        .gap_2()
-                                        .child(
-                                            div()
-                                                .text_sm()
-                                                .text_color(if recording_hotkey {
-                                                    cx.theme().primary
-                                                } else {
-                                                    cx.theme().muted_foreground
-                                                })
-                                                .child(if recording_hotkey {
-                                                    "Press your hotkey combination now... (ESC to cancel)"
-                                                } else {
-                                                    "Click Record, then press your hotkey combination"
-                                                }),
-                                        )
-                                        .child(
-                                            h_flex()
-                                                .gap_2()
-                                                .items_center()
-                                                .child(
-                                                    div()
-                                                        .w(px(200.0))
-                                                        .px_3()
-                                                        .py_2()
-                                                        .rounded(px(6.0))
-                                                        .border_2()
-                                                        .border_color(if recording_hotkey {
-                                                            cx.theme().primary
-                                                        } else {
-                                                            cx.theme().border
-                                                        })
-                                                        .bg(if recording_hotkey {
-                                                            cx.theme().accent
-                                                        } else {
-                                                            cx.theme().muted
-                                                        })
-                                                        .text_sm()
-                                                        .font_medium()
-                                                        .child(if recording_hotkey {
-                                                            "Recording...".to_string()
-                                                        } else {
-                                                            format!("Current: {}", hotkey_str)
-                                                        }),
-                                                )
-                                                .child(
-                                                    Button::new("record-hotkey")
-                                                        .label(if recording_hotkey { "Cancel" } else { "Record" })
-                                                        .map(|btn| {
-                                                            if recording_hotkey {
-                                                                btn.ghost()
-                                                            } else {
-                                                                btn.primary()
-                                                            }
-                                                        })
-                                                        .on_click(cx.listener(|this, _, _, cx| {
-                                                            this.recording_hotkey = !this.recording_hotkey;
-                                                            cx.notify();
-                                                        })),
-                                                ),
-                                        )
-                                        .child(
-                                            div()
-                                                .text_xs()
-                                                .text_color(cx.theme().muted_foreground)
-                                                .child("Tip: Common shortcuts: Ctrl+Shift+S, Ctrl+Shift+A, F12, Win+Shift+S"),
-                                        )
-                                        .child(
-                                            div()
-                                                .text_xs()
-                                                .text_color(cx.theme().muted_foreground)
-                                                .child("Requires restart to apply changes"),
-                                        ),
-                                )
-                            }),
-                    )
-                    // Reset to defaults button
-                    .child(
-                        div().mt_4().child(
-                            Button::new("reset-settings")
-                                .ghost()
-                                .label("Reset to Defaults")
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    let (grid_columns, thumbnail_size, webp_quality) = {
-                                        let app_state = cx.global::<AppState>();
-                                        let mut settings = app_state.settings.lock();
-                                        *settings = Settings::default();
-                                        let _ = settings.save();
-                                        (
-                                            settings.grid_columns,
-                                            settings.thumbnail_size,
-                                            settings.webp_quality,
-                                        )
-                                    };
-                                    this.grid_columns = grid_columns;
-                                    this.thumbnail_size = thumbnail_size;
-                                    // Update slider states
-                                    this.thumbnail_slider.update(cx, |state, cx| {
-                                        state.set_value(thumbnail_size as f32, window, cx);
-                                    });
-                                    this.quality_slider.update(cx, |state, cx| {
-                                        state.set_value(webp_quality as f32, window, cx);
-                                    });
-                                    cx.notify();
-                                })),
-                        ),
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child("Examples: Ctrl+Shift+S, Ctrl+Alt+S, F12"),
                     ),
+            )
+    }
+
+    fn render_about_settings(&self, cx: &Context<Self>) -> impl IntoElement {
+        v_flex()
+            .w_full()
+            .gap_4()
+            .items_center()
+            .py_8()
+            // App Icon
+            .child(
+                div()
+                    .w(px(80.0))
+                    .h(px(80.0))
+                    .rounded(px(16.0))
+                    .bg(cx.theme().primary)
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_size(px(48.0))
+                    .child("📷"),
+            )
+            // App Name
+            .child(
+                div()
+                    .text_2xl()
+                    .font_weight(FontWeight::BOLD)
+                    .child(APP_NAME),
+            )
+            // Version
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(format!("Version {}", APP_VERSION)),
+            )
+            // Description
+            .child(
+                div()
+                    .max_w(px(300.0))
+                    .text_center()
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(
+                        "A lightweight screenshot manager that lives in your system tray. Quickly access, organize, and share your screenshots.",
+                    ),
+            )
+            // Links
+            .child(
+                h_flex()
+                    .gap_2()
+                    .mt_4()
+                    .child(
+                        Button::new("github")
+                            .outline()
+                            .small()
+                            .label("GitHub")
+                            .on_click(|_, _, cx| {
+                                cx.open_url("https://github.com/user/traybin");
+                            }),
+                    ),
+            )
+            // Copyright
+            .child(
+                div()
+                    .mt_4()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child("Made with GPUI"),
             )
     }
 }
