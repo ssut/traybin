@@ -652,7 +652,8 @@ impl Render for TrayBin {
         v_flex()
             .id("main-container")
             .size_full()
-            .bg(cx.theme().background)
+            // Semi-transparent background to allow acrylic blur to show through
+            .bg(gpui::hsla(0.0, 0.0, 0.08, 0.85))
             .track_focus(&self.focus_handle)
             // Keyboard shortcuts
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
@@ -668,13 +669,15 @@ impl Render for TrayBin {
                     // Try to convert keystroke to hotkey string
                     if let Some(hotkey_str) = Self::keystroke_to_hotkey_string(&event.keystroke) {
                         info!("Recorded hotkey: {}", hotkey_str);
-                        // Save the new hotkey
+                        // Save the new hotkey and re-register it
                         {
                             let app_state = cx.global::<AppState>();
                             let mut settings = app_state.settings.lock();
-                            settings.hotkey = hotkey_str;
+                            settings.hotkey = hotkey_str.clone();
                             let _ = settings.save();
                         }
+                        // Update the global hotkey registration
+                        crate::hotkey::update_hotkey(&hotkey_str);
                         this.recording_hotkey = false;
                         cx.notify();
                     }
@@ -722,9 +725,9 @@ impl Render for TrayBin {
                     .id("header-container")
                     .w_full()
                     .border_b_1()
-                    .border_color(cx.theme().border)
-                    // Subtle gradient-like effect with slightly elevated background
-                    .bg(cx.theme().secondary)
+                    .border_color(gpui::hsla(0.0, 0.0, 0.3, 0.3))
+                    // Semi-transparent header for acrylic effect
+                    .bg(gpui::hsla(0.0, 0.0, 0.12, 0.8))
                     .child(
                         h_flex()
                             .w_full()

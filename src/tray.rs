@@ -40,7 +40,10 @@ pub fn set_window_hwnd(hwnd: isize) {
 #[cfg(windows)]
 fn enable_blur_effect(hwnd: isize) {
     use windows::Win32::Foundation::HWND;
-    use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE};
+    use windows::Win32::Graphics::Dwm::{
+        DwmExtendFrameIntoClientArea, DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE,
+    };
+    use windows::Win32::UI::Controls::MARGINS;
 
     unsafe {
         let hwnd = HWND(hwnd as *mut std::ffi::c_void);
@@ -53,6 +56,15 @@ fn enable_blur_effect(hwnd: isize) {
             &dark_mode as *const _ as *const std::ffi::c_void,
             std::mem::size_of::<i32>() as u32,
         );
+
+        // Extend frame into client area (required for blur/acrylic to show through)
+        let margins = MARGINS {
+            cxLeftWidth: -1,
+            cxRightWidth: -1,
+            cyTopHeight: -1,
+            cyBottomHeight: -1,
+        };
+        let _ = DwmExtendFrameIntoClientArea(hwnd, &margins);
 
         // Try to enable Mica/Acrylic backdrop (Windows 11 22H2+)
         // DWMWA_SYSTEMBACKDROP_TYPE = 38
@@ -71,35 +83,102 @@ fn enable_blur_effect(hwnd: isize) {
         if result.is_ok() {
             info!("Enabled Windows 11 acrylic backdrop effect");
         } else {
-            // Fallback: Try the older Windows 10 blur approach
-            debug!("Windows 11 backdrop not available, trying legacy blur");
-            enable_legacy_blur(hwnd);
+            // Fallback: Try the older approach with SetWindowCompositionAttribute
+            debug!("Windows 11 backdrop not available, trying composition attribute");
+            enable_composition_blur(hwnd);
         }
     }
 }
 
-/// Legacy blur effect for Windows 10
+/// Enable blur using SetWindowCompositionAttribute (Windows 10+)
 #[cfg(windows)]
-fn enable_legacy_blur(hwnd: windows::Win32::Foundation::HWND) {
-    use windows::Win32::Graphics::Dwm::DwmEnableBlurBehindWindow;
-    use windows::Win32::Graphics::Dwm::DWM_BB_ENABLE;
-    use windows::Win32::Graphics::Dwm::DWM_BLURBEHIND;
+fn enable_composition_blur(hwnd: windows::Win32::Foundation::HWND) {
+    use windows::Win32::Foundation::BOOL;
 
-    unsafe {
-        let blur_behind = DWM_BLURBEHIND {
-            dwFlags: DWM_BB_ENABLE,
-            fEnable: true.into(),
-            hRgnBlur: windows::Win32::Graphics::Gdi::HRGN::default(),
-            fTransitionOnMaximized: false.into(),
+    // AccentState values
+    const ACCENT_ENABLE_BLURBEHIND: i32 = 3;
+    const ACCENT_ENABLE_ACRYLICBLURBEHIND: i32 = 4;
+
+    #[repr(C)]
+    struct AccentPolicy {
+        accent_state: i32,
+        accent_flags: i32,
+        gradient_color: u32,
+        animation_id: i32,
+    }
+
+    #[repr(C)]
+    struct WindowCompositionAttributeData {
+        attribute: i32,
+        data: *mut std::ffi::c_void,
+        size: usize,
+    }
+
+    // WCA_ACCENT_POLICY = 19
+    const WCA_ACCENT_POLICY: i32 = 19;
+
+    // Try to get SetWindowCompositionAttribute from user32.dll
+    let user32 = unsafe {
+        windows::Win32::System::LibraryLoader::GetModuleHandleW(windows::core::w!("user32.dll"))
+    };
+
+    if let Ok(user32) = user32 {
+        let func = unsafe {
+            windows::Win32::System::LibraryLoader::GetProcAddress(
+                user32,
+                windows::core::s!("SetWindowCompositionAttribute"),
+            )
         };
 
-        let result = DwmEnableBlurBehindWindow(hwnd, &blur_behind);
-        if result.is_ok() {
-            info!("Enabled legacy blur behind window");
-        } else {
-            debug!("Legacy blur not available: {:?}", result);
+        if let Some(set_window_composition_attribute) = func {
+            let set_attr: unsafe extern "system" fn(
+                windows::Win32::Foundation::HWND,
+                *mut WindowCompositionAttributeData,
+            ) -> BOOL = unsafe { std::mem::transmute(set_window_composition_attribute) };
+
+            // Try acrylic first (Windows 10 1803+)
+            let mut policy = AccentPolicy {
+                accent_state: ACCENT_ENABLE_ACRYLICBLURBEHIND,
+                accent_flags: 2,            // Draw all borders
+                gradient_color: 0x80000000, // Semi-transparent black (ABGR format)
+                animation_id: 0,
+            };
+
+            let mut data = WindowCompositionAttributeData {
+                attribute: WCA_ACCENT_POLICY,
+                data: &mut policy as *mut _ as *mut std::ffi::c_void,
+                size: std::mem::size_of::<AccentPolicy>(),
+            };
+
+            let result = unsafe { set_attr(hwnd, &mut data) };
+            if result.as_bool() {
+                info!("Enabled acrylic blur via SetWindowCompositionAttribute");
+                return;
+            }
+
+            // Fallback to simple blur
+            let mut blur_policy = AccentPolicy {
+                accent_state: ACCENT_ENABLE_BLURBEHIND,
+                accent_flags: 2,
+                gradient_color: 0x00000000,
+                animation_id: 0,
+            };
+
+            let mut blur_data = WindowCompositionAttributeData {
+                attribute: WCA_ACCENT_POLICY,
+                data: &mut blur_policy as *mut _ as *mut std::ffi::c_void,
+                size: std::mem::size_of::<AccentPolicy>(),
+            };
+
+            let result = unsafe { set_attr(hwnd, &mut blur_data) };
+            if result.as_bool() {
+                info!("Enabled blur behind via SetWindowCompositionAttribute");
+                return;
+            }
         }
     }
+
+    debug!("SetWindowCompositionAttribute not available");
 }
 
 /// Check if our window is currently the foreground (focused) window
