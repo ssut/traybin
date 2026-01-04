@@ -8,7 +8,7 @@ use global_hotkey::{
 use log::{error, info, warn};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::tray::show_window;
+use crate::tray::toggle_window;
 use crate::AppMessage;
 
 /// Global flag to track if hotkey is enabled at runtime
@@ -16,7 +16,7 @@ static HOTKEY_ENABLED: AtomicBool = AtomicBool::new(true);
 
 /// Initialize global hotkey manager with custom hotkey string
 pub fn init_global_hotkey(
-    message_tx: Sender<AppMessage>,
+    _message_tx: Sender<AppMessage>,
     hotkey_str: &str,
 ) -> Option<GlobalHotKeyManager> {
     let manager = match GlobalHotKeyManager::new() {
@@ -56,9 +56,8 @@ pub fn init_global_hotkey(
             if let Ok(event) = receiver.recv() {
                 if event.id == hotkey_id && event.state == HotKeyState::Pressed {
                     if HOTKEY_ENABLED.load(Ordering::SeqCst) {
-                        info!("Global hotkey pressed - showing window");
-                        show_window();
-                        let _ = message_tx.send(AppMessage::ToggleWindow);
+                        info!("Global hotkey pressed - toggling window");
+                        toggle_window();
                     } else {
                         warn!("Global hotkey pressed but disabled");
                     }

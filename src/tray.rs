@@ -24,10 +24,198 @@ const DRAG_THRESHOLD: f64 = 5.0;
 /// Shared state for window handle
 pub static WINDOW_HWND: Mutex<Option<isize>> = Mutex::new(None);
 
+/// Track window visibility
+static WINDOW_VISIBLE: AtomicBool = AtomicBool::new(true);
+
 /// Set the window handle for tray operations
 pub fn set_window_hwnd(hwnd: isize) {
     *WINDOW_HWND.lock() = Some(hwnd);
+
+    // Enable Windows 11 acrylic/mica effect
+    #[cfg(windows)]
+    enable_blur_effect(hwnd);
 }
+
+/// Enable Windows 11 style blur/acrylic background effect
+#[cfg(windows)]
+fn enable_blur_effect(hwnd: isize) {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE};
+
+    unsafe {
+        let hwnd = HWND(hwnd as *mut std::ffi::c_void);
+
+        // Enable dark mode for the window frame
+        let dark_mode: i32 = 1;
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_USE_IMMERSIVE_DARK_MODE,
+            &dark_mode as *const _ as *const std::ffi::c_void,
+            std::mem::size_of::<i32>() as u32,
+        );
+
+        // Try to enable Mica/Acrylic backdrop (Windows 11 22H2+)
+        // DWMWA_SYSTEMBACKDROP_TYPE = 38
+        const DWMWA_SYSTEMBACKDROP_TYPE: u32 = 38;
+        // DWMSBT_TRANSIENTWINDOW = 3 (Acrylic)
+        // DWMSBT_MAINWINDOW = 2 (Mica)
+        // DWMSBT_TABBEDWINDOW = 4 (Tabbed Mica)
+        let backdrop_type: i32 = 3; // Acrylic
+        let result = DwmSetWindowAttribute(
+            hwnd,
+            windows::Win32::Graphics::Dwm::DWMWINDOWATTRIBUTE(DWMWA_SYSTEMBACKDROP_TYPE as i32),
+            &backdrop_type as *const _ as *const std::ffi::c_void,
+            std::mem::size_of::<i32>() as u32,
+        );
+
+        if result.is_ok() {
+            info!("Enabled Windows 11 acrylic backdrop effect");
+        } else {
+            // Fallback: Try the older Windows 10 blur approach
+            debug!("Windows 11 backdrop not available, trying legacy blur");
+            enable_legacy_blur(hwnd);
+        }
+    }
+}
+
+/// Legacy blur effect for Windows 10
+#[cfg(windows)]
+fn enable_legacy_blur(hwnd: windows::Win32::Foundation::HWND) {
+    use windows::Win32::Graphics::Dwm::DwmEnableBlurBehindWindow;
+    use windows::Win32::Graphics::Dwm::DWM_BB_ENABLE;
+    use windows::Win32::Graphics::Dwm::DWM_BLURBEHIND;
+
+    unsafe {
+        let blur_behind = DWM_BLURBEHIND {
+            dwFlags: DWM_BB_ENABLE,
+            fEnable: true.into(),
+            hRgnBlur: windows::Win32::Graphics::Gdi::HRGN::default(),
+            fTransitionOnMaximized: false.into(),
+        };
+
+        let result = DwmEnableBlurBehindWindow(hwnd, &blur_behind);
+        if result.is_ok() {
+            info!("Enabled legacy blur behind window");
+        } else {
+            debug!("Legacy blur not available: {:?}", result);
+        }
+    }
+}
+
+/// Check if our window is currently the foreground (focused) window
+#[cfg(windows)]
+pub fn is_window_focused() -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+
+    if let Some(hwnd) = *WINDOW_HWND.lock() {
+        unsafe {
+            let foreground = GetForegroundWindow();
+            foreground.0 as isize == hwnd
+        }
+    } else {
+        false
+    }
+}
+
+#[cfg(not(windows))]
+pub fn is_window_focused() -> bool {
+    false
+}
+
+/// Check if window is visible
+pub fn is_window_visible() -> bool {
+    WINDOW_VISIBLE.load(Ordering::SeqCst)
+}
+
+/// Hide the window
+#[cfg(windows)]
+pub fn hide_window() {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE};
+
+    if let Some(hwnd) = *WINDOW_HWND.lock() {
+        unsafe {
+            let hwnd = HWND(hwnd as *mut std::ffi::c_void);
+            let _ = ShowWindow(hwnd, SW_HIDE);
+            WINDOW_VISIBLE.store(false, Ordering::SeqCst);
+            info!("Window hidden");
+        }
+    }
+}
+
+#[cfg(not(windows))]
+pub fn hide_window() {
+    // Not implemented for non-Windows
+}
+
+/// Move window to the monitor where the cursor is located
+#[cfg(windows)]
+fn move_window_to_cursor_monitor() {
+    use windows::Win32::Foundation::{HWND, POINT, RECT};
+    use windows::Win32::Graphics::Gdi::{
+        GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetCursorPos, GetWindowRect, SetWindowPos, HWND_TOP, SWP_NOSIZE, SWP_NOZORDER,
+    };
+
+    if let Some(hwnd) = *WINDOW_HWND.lock() {
+        unsafe {
+            let hwnd = HWND(hwnd as *mut std::ffi::c_void);
+
+            // Get cursor position
+            let mut cursor_pos = POINT::default();
+            if GetCursorPos(&mut cursor_pos).is_err() {
+                return;
+            }
+
+            // Get monitor at cursor position
+            let monitor = MonitorFromPoint(cursor_pos, MONITOR_DEFAULTTONEAREST);
+
+            // Get monitor info
+            let mut monitor_info = MONITORINFO {
+                cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+                ..Default::default()
+            };
+            if !GetMonitorInfoW(monitor, &mut monitor_info).as_bool() {
+                return;
+            }
+
+            // Get current window rect
+            let mut window_rect = RECT::default();
+            if GetWindowRect(hwnd, &mut window_rect).is_err() {
+                return;
+            }
+
+            let window_width = window_rect.right - window_rect.left;
+            let window_height = window_rect.bottom - window_rect.top;
+
+            // Calculate centered position on the monitor
+            let monitor_work = monitor_info.rcWork;
+            let monitor_width = monitor_work.right - monitor_work.left;
+            let monitor_height = monitor_work.bottom - monitor_work.top;
+
+            let new_x = monitor_work.left + (monitor_width - window_width) / 2;
+            let new_y = monitor_work.top + (monitor_height - window_height) / 2;
+
+            // Move window to new position
+            let _ = SetWindowPos(
+                hwnd,
+                HWND_TOP,
+                new_x,
+                new_y,
+                0,
+                0,
+                SWP_NOSIZE | SWP_NOZORDER,
+            );
+            debug!(
+                "Moved window to monitor at cursor position ({}, {})",
+                new_x, new_y
+            );
+        }
+    }
+}
+
 /// Show and activate the window using Windows API
 #[cfg(windows)]
 pub fn show_window() {
@@ -36,12 +224,17 @@ pub fn show_window() {
         SetForegroundWindow, ShowWindow, SW_RESTORE, SW_SHOW,
     };
 
+    // First move window to cursor's monitor
+    move_window_to_cursor_monitor();
+
     if let Some(hwnd) = *WINDOW_HWND.lock() {
         unsafe {
             let hwnd = HWND(hwnd as *mut std::ffi::c_void);
             let _ = ShowWindow(hwnd, SW_RESTORE);
             let _ = ShowWindow(hwnd, SW_SHOW);
             let _ = SetForegroundWindow(hwnd);
+            WINDOW_VISIBLE.store(true, Ordering::SeqCst);
+            info!("Window shown and focused");
         }
     }
 }
@@ -49,6 +242,23 @@ pub fn show_window() {
 #[cfg(not(windows))]
 pub fn show_window() {
     // Not implemented for non-Windows
+}
+
+/// Toggle window visibility - hide if focused, show if not
+#[cfg(windows)]
+pub fn toggle_window() {
+    if is_window_focused() && is_window_visible() {
+        info!("Window is focused, hiding");
+        hide_window();
+    } else {
+        info!("Window is not focused or hidden, showing");
+        show_window();
+    }
+}
+
+#[cfg(not(windows))]
+pub fn toggle_window() {
+    show_window();
 }
 
 pub struct TrayManager {
@@ -116,8 +326,7 @@ impl TrayManager {
                             if TRAY_MOUSE_DOWN.load(Ordering::SeqCst) {
                                 TRAY_MOUSE_DOWN.store(false, Ordering::SeqCst);
                                 *TRAY_DRAG_START.lock() = None;
-                                show_window();
-                                let _ = click_tx.send(AppMessage::ToggleWindow);
+                                toggle_window();
                             }
                         }
                         TrayIconEvent::Move { position, .. } => {
